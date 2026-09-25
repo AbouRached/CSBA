@@ -101,3 +101,7 @@ request folder access. No audio, no deletes, no passwords or MFA.
 ```powershell
 .\.venv\Scripts\python -m pytest -q
 ```
+
+## License
+
+[MIT](LICENSE)
