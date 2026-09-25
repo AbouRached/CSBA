@@ -9,7 +9,7 @@ from pydantic import BaseModel, Field
 from . import audit
 from .config import Config
 from .deps import STAFF_ONLY, client_ip, current_user, from_staff_network, get_cfg, get_conn, session_user
-from .scope import Principal
+from .scope import Principal, load_memberships
 from .security import (
     SESSION_COOKIE,
     account_locked,
@@ -50,20 +50,23 @@ def _set_cookie(resp: Response, token: str, cfg: Config) -> None:
 
 
 def principal_json(p: Principal, conn: sqlite3.Connection) -> dict:
-    cust = None
-    if p.customer_id is not None:
-        row = conn.execute("SELECT id, slug, name FROM customers WHERE id = ?", (p.customer_id,)).fetchone()
-        if row:
-            cust = dict(row)
+    customers = []
+    if p.customer_ids:
+        q = ",".join("?" * len(p.customer_ids))
+        customers = [dict(r) for r in conn.execute(
+            f"SELECT id, slug, name FROM customers WHERE id IN ({q}) ORDER BY name", p.customer_ids)]
     depts = []
     if p.department_ids:
         q = ",".join("?" * len(p.department_ids))
-        depts = [dict(r) for r in conn.execute(f"SELECT id, name FROM departments WHERE id IN ({q})", p.department_ids)]
+        depts = [dict(r) for r in conn.execute(
+            f"SELECT d.id, d.name, d.customer_id, c.name AS customer_name FROM departments d "
+            f"JOIN customers c ON c.id = d.customer_id WHERE d.id IN ({q}) ORDER BY c.name, d.name", p.department_ids)]
     return {
         "id": p.user_id,
         "username": p.username,
         "role": p.role,
-        "customer": cust,
+        "customers": customers,
+        "customer": customers[0] if len(customers) == 1 else None,  # single-customer convenience
         "departments": depts,
         "must_change_password": p.must_change_password,
         "mfa_ok": p.mfa_ok,
@@ -117,12 +120,12 @@ def login(
     _set_cookie(response, token, cfg)
     # Password accepted; the session is useless until the authenticator code is verified.
     audit.log(conn, "login.password_ok", ip=ip, username=row["username"], user_id=row["id"], customer_id=row["customer_id"])
+    cust_ids, dept_ids = load_memberships(conn, row["id"], row["role"], row["customer_id"])
     p = Principal(
         user_id=row["id"], username=row["username"], role=row["role"],
         customer_id=row["customer_id"], must_change_password=bool(row["must_change_password"]),
         mfa_ok=False, mfa_enrolled=bool(row["mfa_enabled"]),
-        department_ids=[r["department_id"] for r in conn.execute(
-            "SELECT department_id FROM user_departments WHERE user_id = ?", (row["id"],))],
+        department_ids=dept_ids, customer_ids=cust_ids,
     )
     return principal_json(p, conn)
 

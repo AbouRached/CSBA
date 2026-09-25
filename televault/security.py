@@ -21,7 +21,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, VerificationError, InvalidHashError
 
 from .config import Config
-from .scope import Principal
+from .scope import Principal, load_memberships
 
 SESSION_COOKIE = "televault_session"
 CSRF_HEADER = "x-requested-with"
@@ -122,16 +122,14 @@ def resolve_session(conn: sqlite3.Connection, token: str | None, cfg: Config) ->
         "UPDATE sessions SET expires_at = ? WHERE token_hash = ?",
         (iso(now_utc() + timedelta(hours=cfg.session_ttl_hours)), row["token_hash"]),
     )
-    dept_ids = [
-        r["department_id"]
-        for r in conn.execute("SELECT department_id FROM user_departments WHERE user_id = ?", (row["id"],))
-    ]
+    cust_ids, dept_ids = load_memberships(conn, row["id"], row["role"], row["customer_id"])
     return Principal(
         user_id=row["id"],
         username=row["username"],
         role=row["role"],
         customer_id=row["customer_id"],
         department_ids=dept_ids,
+        customer_ids=cust_ids,
         must_change_password=bool(row["must_change_password"]),
         mfa_ok=bool(row["mfa_ok"]),
         mfa_enrolled=bool(row["mfa_enabled"]),

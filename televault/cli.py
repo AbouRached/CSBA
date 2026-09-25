@@ -233,7 +233,13 @@ def cmd_remove_customer(args) -> int:
         if cust is None:
             print(f"No customer '{args.slug}' - nothing to do.")
             return 0
-        users = [r["username"] for r in c.execute("SELECT username FROM users WHERE customer_id = ?", (cust["id"],))]
+        from .scope import load_memberships
+        # users who would be left with no customer at all once this one is gone
+        users = []
+        for u in c.execute("SELECT * FROM users WHERE role <> 'superadmin'").fetchall():
+            cids, _ = load_memberships(c, u["id"], u["role"], u["customer_id"])
+            if cids == [cust["id"]]:
+                users.append(u["username"])
         n_rec = c.execute("SELECT COUNT(*) FROM recordings WHERE customer_id = ?", (cust["id"],)).fetchone()[0]
         depts = [r["name"] for r in c.execute("SELECT name FROM departments WHERE customer_id = ?", (cust["id"],))]
         print(f"Customer {cust['slug']} ({cust['name']}) -> {cust['root_path']}")
@@ -243,6 +249,8 @@ def cmd_remove_customer(args) -> int:
             return 1
         # sessions/user_departments/departments/recordings/index_runs/access_grants cascade
         c.execute("DELETE FROM customers WHERE id = ?", (cust["id"],))
+        if users:  # memberships cascaded; accounts left with nothing are removed too
+            c.execute(f"DELETE FROM users WHERE username IN ({','.join('?' * len(users))})", users)
         from . import audit
         audit.configure(cfg.audit_to_eventlog)  # also mirror to the Windows Event Log
         audit.log(c, "cli.customer.remove", username="console", customer_id=cust["id"],
@@ -255,8 +263,12 @@ def cmd_list_users(_args) -> int:
     cfg = load_config()
     db = Database(cfg.db_path)
     with db.conn() as c:
-        for r in c.execute("SELECT u.*, c.slug FROM users u LEFT JOIN customers c ON c.id=u.customer_id ORDER BY u.id"):
-            print(f"#{r['id']:<3} {r['username']:<24} {r['role']:<15} {r['slug'] or '-':<14} "
+        from .scope import load_memberships
+        slugs = {r["id"]: r["slug"] for r in c.execute("SELECT id, slug FROM customers")}
+        for r in c.execute("SELECT * FROM users ORDER BY id").fetchall():
+            cids, _ = load_memberships(c, r["id"], r["role"], r["customer_id"])
+            cust = ",".join(slugs.get(x, "?") for x in cids) or "-"
+            print(f"#{r['id']:<3} {r['username']:<24} {r['role']:<15} {cust:<14} "
                   f"{'active' if r['active'] else 'disabled':<9} MFA {'yes' if r['mfa_enabled'] else 'not set up'}")
     return 0
 

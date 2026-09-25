@@ -95,7 +95,7 @@ def test_explain_access_matches_real_scope(env, mcp):
     assert not err and no["visible"] is False
     err, other = mcp["tool"]("explain_access", {"username": "beta_admin",
                                                 "recording": "in-3282-27972203-20260820-092903-1787207343.370894.wav"})
-    assert other["visible"] is False and "another customer" in other["why"][0]
+    assert other["visible"] is False and "not one of the user's customers" in other["why"][0]
     # cross-check with the web API as that user
     c = env["client"]; login(c, "alpha_support")
     names = {x["filename"] for x in c.get("/api/recordings", params={"q": "out-3281883752"}).json()["items"]}

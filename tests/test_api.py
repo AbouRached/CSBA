@@ -164,7 +164,7 @@ def test_admin_isolation(env):
     # cross-customer department attach is refused
     with env["db"].conn() as db:
         db.execute("INSERT INTO departments(id, customer_id, name) VALUES (50, 2, 'BetaDept')")
-    assert c.post("/api/admin/users", json={"username": "sales2", "role": "department", "department_ids": [50]}, headers=HDR).status_code == 400
+    assert c.post("/api/admin/users", json={"username": "sales2", "role": "department", "department_ids": [50]}, headers=HDR).status_code == 403
     # the new user sees only ext 851
     c.post("/api/auth/logout", headers=HDR)
     login(c, "sales1", r.json()["initial_password"])

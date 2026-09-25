@@ -88,8 +88,7 @@ function render() {
   if (!state.me) { app.hidden = true; login.hidden = false; $("#login-error").textContent = ""; $("#login-form input[name=username]").focus(); return; }
   login.hidden = true; app.hidden = false;
   $("#who-name").textContent = state.me.username;
-  $("#who-scope").textContent = state.me.role === "superadmin" ? "Staff"
-    : state.me.customer ? `${state.me.customer.name}${state.me.departments.length ? " · " + state.me.departments.map(d => d.name).join(", ") : ""}` : "";
+  $("#who-scope").textContent = state.me.role === "superadmin" ? "Staff" : scopeLabel(state.me);
   const main = $("#main"); main.replaceChildren();
   // Mandatory second factor: nothing else is reachable (server-side too) until it passes.
   if (!state.me.mfa_ok) { $("#nav").replaceChildren(); viewMfa(main); return; }
@@ -196,17 +195,35 @@ function viewPassword(main) {
 }
 
 /* ------------------------------------------------------------------ recordings */
-async function customerPicker(onchange) {
-  if (state.me.role !== "superadmin") return null;
-  if (!state.customers.length) state.customers = await api("/api/admin/customers");
-  if (state.customerId === null && state.customers.length) state.customerId = state.customers[0].id;
-  const sel = h("select", { onchange: (e) => { state.customerId = Number(e.target.value); state.page = 1; onchange(); } },
-    ...state.customers.map(c => h("option", { value: c.id, selected: c.id === state.customerId ? "" : null }, `${c.name} (${c.slug})${c.online ? "" : " — offline"}`)));
+/* "Alpha · Support, Beta" - what a non-staff user can see, for the top bar. */
+function scopeLabel(me) {
+  const names = me.customers.map(c => c.name);
+  const cust = names.length > 2 ? `${names.slice(0, 2).join(", ")} +${names.length - 2}` : names.join(", ");
+  return me.departments.length ? `${cust} · ${me.departments.map(d => d.name).join(", ")}` : cust;
+}
+
+/* Customer picker. Superadmins pick from every customer; other users from their own
+   customers (no picker when they have only one). allowAll adds an "All customers" choice
+   (state.customerId = null). */
+async function customerPicker(onchange, { allowAll = false } = {}) {
+  let list;
+  if (state.me.role === "superadmin") {
+    if (!state.customers.length) state.customers = await api("/api/admin/customers");
+    list = state.customers;
+  } else {
+    list = state.me.customers;
+    if (list.length <= 1) { state.customerId = list.length ? list[0].id : null; return null; }
+  }
+  if (state.customerId !== null && !list.some(c => c.id === state.customerId)) state.customerId = null;
+  if (state.customerId === null && !allowAll && list.length) state.customerId = list[0].id;
+  const sel = h("select", { onchange: (e) => { state.customerId = e.target.value ? Number(e.target.value) : null; state.page = 1; onchange(); } },
+    allowAll ? h("option", { value: "", selected: state.customerId === null ? "" : null }, "All customers") : null,
+    ...list.map(c => h("option", { value: c.id, selected: c.id === state.customerId ? "" : null }, `${c.name} (${c.slug})${c.online === false ? " — offline" : ""}`)));
   return h("label", {}, "Customer", sel);
 }
 
 async function viewRecordings(main) {
-  const picker = await customerPicker(() => viewRecordings(main));
+  const picker = await customerPicker(() => viewRecordings(main), { allowAll: state.me.role !== "superadmin" });
   const f = state.filters;
   const filterRow = h("div", { class: "row" },
     picker,
@@ -242,14 +259,14 @@ async function viewRecordings(main) {
 
   function query() {
     const p = new URLSearchParams();
-    if (state.me.role === "superadmin" && state.customerId) p.set("customer_id", state.customerId);
+    if (state.customerId) p.set("customer_id", state.customerId);
     for (const [k, v] of Object.entries(state.filters)) if (v) p.set(k, v === true ? "true" : v);
     return p;
   }
 
   async function loadSummary() {
     try {
-      const p = new URLSearchParams(); if (state.me.role === "superadmin" && state.customerId) p.set("customer_id", state.customerId);
+      const p = new URLSearchParams(); if (state.customerId) p.set("customer_id", state.customerId);
       const s = await api(`/api/recordings/summary?${p}`);
       const chips = [h("span", { class: "chip" }, h("b", {}, s.count.toLocaleString()), " files · ", fmtBytes(s.bytes))];
       if (s.first) chips.push(h("span", { class: "chip" }, fmtTs(s.first).slice(0, 10), " → ", fmtTs(s.last).slice(0, 10)));
@@ -298,7 +315,7 @@ async function viewRecordings(main) {
     await downloadZip({ ids });
   }
   async function zipFiltered() {
-    const f = { ...state.filters, customer_id: state.me.role === "superadmin" ? state.customerId : null };
+    const f = { ...state.filters, customer_id: state.customerId };
     const body = { filters: { customer_id: f.customer_id, date_from: f.date_from || null, date_to: f.date_to || null, rec_type: f.type || null, ext: f.ext || null, number: f.number || null, q: f.q || null, include_empty: !!f.include_empty } };
     await downloadZip(body);
   }
@@ -587,7 +604,7 @@ function openDeptFolderPicker(cid, onPick) {
 const splitList = (s) => s.split(/[\s,;]+/).map(x => x.trim()).filter(Boolean);
 async function viewDepartments(main) {
   const picker = await customerPicker(() => viewDepartments(main));
-  const cid = state.me.role === "superadmin" ? state.customerId : state.me.customer.id;
+  const cid = state.customerId;
   const list = cid ? await api(`/api/admin/departments?customer_id=${cid}`) : [];
   const form = deptForm(cid);
   main.replaceChildren(
@@ -635,53 +652,88 @@ function deptForm(cid, d = null, existing = null) {
 
 /* ------------------------------------------------------------------ admin: users */
 async function viewUsers(main) {
-  const picker = await customerPicker(() => viewUsers(main));
-  const cid = state.me.role === "superadmin" ? state.customerId : state.me.customer.id;
-  const [users, depts] = await Promise.all([api(`/api/admin/users${cid ? `?customer_id=${cid}` : ""}`), cid ? api(`/api/admin/departments?customer_id=${cid}`) : []]);
-  const dname = (id) => depts.find(d => d.id === id)?.name || `#${id}`;
-  const form = userForm(cid, depts);
+  const staff = state.me.role === "superadmin";
+  const picker = await customerPicker(() => viewUsers(main), { allowAll: true });
+  const cid = state.customerId;
+  // everything the admin may assign: all customers/departments (staff) or their own
+  const customers = staff ? state.customers : state.me.customers;
+  const [users, depts] = await Promise.all([
+    api(`/api/admin/users${cid ? `?customer_id=${cid}` : ""}`),
+    api("/api/admin/departments"),
+  ]);
+  const cname = (id) => customers.find(c => c.id === id)?.name || `#${id}`;
+  const dlabel = (id) => { const d = depts.find(x => x.id === id); return d ? `${cname(d.customer_id)} · ${d.name}` : `#${id}`; };
+  const roleLabel = { superadmin: "Superadmin (staff)", customer_admin: "Customer admin", department: "Department" };
+  const scopeOf = (u) => u.role === "superadmin" ? "all customers"
+    : u.role === "customer_admin" ? u.customer_ids.map(cname).join(", ") : u.department_ids.map(dlabel).join(", ");
+  const form = userForm(customers, depts);
   const secretBox = h("div", { hidden: "" });
   main.replaceChildren(
     h("div", { class: "card" }, h("h2", {}, "Users"),
       picker ? h("div", { class: "row" }, picker) : null,
-      h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Username", "Name", "Role", "Departments", "Status", "Authenticator", "Last login", ""].map(t => h("th", {}, t)))),
-        h("tbody", {}, ...users.filter(u => u.role !== "superadmin").map(u => h("tr", {},
-          h("td", { class: "mono" }, u.username), h("td", {}, u.display_name), h("td", {}, u.role === "customer_admin" ? "Customer admin" : "Department"),
-          h("td", {}, u.role === "department" ? u.department_ids.map(dname).join(", ") : "all"),
+      h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Username", "Name", "Role", "Customers / departments", "Status", "Authenticator", "Last login", ""].map(t => h("th", {}, t)))),
+        h("tbody", {}, ...users.map(u => h("tr", {},
+          h("td", { class: "mono" }, u.username), h("td", {}, u.display_name), h("td", {}, roleLabel[u.role] || u.role),
+          h("td", { class: "wrap" }, scopeOf(u)),
           h("td", {}, u.active ? (u.locked_until && u.locked_until > new Date().toISOString() ? h("b", { class: "error" }, "locked") : u.must_change_password ? h("span", { class: "muted" }, "must change pw") : "active") : h("b", { class: "error" }, "disabled")),
           h("td", {}, u.mfa_enabled ? h("span", { class: "ok" }, "linked") : h("span", { class: "muted" }, "set up at next sign-in")),
           h("td", { class: "muted" }, fmtTs(u.last_login) || "never"),
           h("td", { class: "actions" },
-            h("button", { class: "btn small", type: "button", onclick: () => userForm(cid, depts, u, form) }, "Edit"),
-            u.mfa_enabled ? h("button", { class: "btn small", type: "button", onclick: async () => { if (!confirm(`Reset the authenticator for ${u.username}? They will scan a new QR code at next sign-in and are signed out now.`)) return; try { await api(`/api/admin/users/${u.id}/reset-mfa`, { method: "POST" }); toast("Authenticator reset."); render(); } catch (e) { toast(e.message, true); } } }, "Reset MFA") : null,
-            h("button", { class: "btn small", type: "button", onclick: async () => { if (!confirm(`Reset password for ${u.username}? Their sessions will be signed out.`)) return; try { const r = await api(`/api/admin/users/${u.id}/reset-password`, { method: "POST" }); showSecret(secretBox, u.username, r.initial_password); } catch (e) { toast(e.message, true); } } }, "Reset password")))))))),
+            u.is_self ? h("span", { class: "muted" }, "you") : null,
+            u.manageable ? h("button", { class: "btn small", type: "button", onclick: () => userForm(customers, depts, u, form) }, "Edit") : null,
+            u.manageable && u.mfa_enabled ? h("button", { class: "btn small", type: "button", onclick: async () => { if (!confirm(`Reset the authenticator for ${u.username}? They will scan a new QR code at next sign-in and are signed out now.`)) return; try { await api(`/api/admin/users/${u.id}/reset-mfa`, { method: "POST" }); toast("Authenticator reset."); render(); } catch (e) { toast(e.message, true); } } }, "Reset MFA") : null,
+            u.manageable ? h("button", { class: "btn small", type: "button", onclick: async () => { if (!confirm(`Reset password for ${u.username}? Their sessions will be signed out.`)) return; try { const r = await api(`/api/admin/users/${u.id}/reset-password`, { method: "POST" }); showSecret(secretBox, u.username, r.initial_password); } catch (e) { toast(e.message, true); } } }, "Reset password") : null,
+            !u.manageable && !u.is_self ? h("span", { class: "muted", title: "Has access outside your customers - managed by staff" }, "staff-managed") : null))),
+          users.length ? null : h("tr", {}, h("td", { colspan: "8", class: "muted" }, "No users.")))))),
     h("div", { class: "card" }, secretBox, form));
 }
 function showSecret(box, username, pw) {
   box.hidden = false;
-  box.replaceChildren(h("p", {}, h("b", {}, `Temporary password for ${username}`), " — shown once. Hand it over securely; they must change it at first sign-in."),
+  box.replaceChildren(h("p", {}, h("b", {}, `Temporary password for ${username}`), " — shown once. Hand it over securely; they must change it at first sign-in and set up Microsoft Authenticator."),
     h("div", { class: "secret" }, pw), h("br"));
 }
-function userForm(cid, depts, u = null, existing = null) {
+/* Add / edit a user. Roles: department user (departments, possibly of several customers),
+   customer admin (one or more customers; staff only), superadmin (staff only). */
+function userForm(customers, depts, u = null, existing = null) {
   const form = existing || h("form", { class: "row" });
-  const canAdmin = state.me.role === "superadmin";
-  setKids(form, 
+  const staff = state.me.role === "superadmin";
+  const cname = (id) => customers.find(c => c.id === id)?.name || `#${id}`;
+  const role0 = u?.role || "department";
+  const show = () => {
+    const r = form.role.value;
+    form.querySelector("[name=depts]").closest("label").hidden = r !== "department";
+    form.querySelector("[name=custs]").closest("label").hidden = r !== "customer_admin";
+    form.querySelector(".superadmin-note").hidden = r !== "superadmin";
+  };
+  setKids(form,
     h("h2", { style: "width:100%" }, u ? `Edit ${u.username}` : "Add user"),
     h("label", {}, "Username", h("input", { name: "username", value: u?.username || "", required: "", placeholder: "j.doe" })),
     h("label", {}, "Display name", h("input", { name: "display_name", value: u?.display_name || "" })),
-    h("label", {}, "Role", h("select", { name: "role", onchange: (e) => form.querySelector("[name=depts]").closest("label").hidden = e.target.value !== "department" },
-      h("option", { value: "department", selected: !u || u.role === "department" ? "" : null }, "Department user"),
-      canAdmin ? h("option", { value: "customer_admin", selected: u?.role === "customer_admin" ? "" : null }, "Customer admin (whole drive)") : null)),
-    h("label", { hidden: u?.role === "customer_admin" ? "" : null }, "Departments (ctrl-click for several)", h("select", { name: "depts", multiple: "", size: "4" }, ...depts.map(d => h("option", { value: d.id, selected: u?.department_ids.includes(d.id) ? "" : null }, d.name)))),
+    h("label", {}, "Role", h("select", { name: "role", onchange: show },
+      h("option", { value: "department", selected: role0 === "department" ? "" : null }, "Department user"),
+      staff ? h("option", { value: "customer_admin", selected: role0 === "customer_admin" ? "" : null }, "Customer admin (whole drive of each customer)") : null,
+      staff ? h("option", { value: "superadmin", selected: role0 === "superadmin" ? "" : null }, "Superadmin (staff: every customer)") : null)),
+    h("label", { class: "grow" }, "Departments — any customer (ctrl-click for several)",
+      h("select", { name: "depts", multiple: "", size: "6" },
+        ...depts.map(d => h("option", { value: d.id, selected: u?.department_ids.includes(d.id) ? "" : null }, `${cname(d.customer_id)} · ${d.name}`)))),
+    h("label", { class: "grow" }, "Customers (ctrl-click for several)",
+      h("select", { name: "custs", multiple: "", size: "6" },
+        ...customers.map(c => h("option", { value: c.id, selected: u?.customer_ids.includes(c.id) ? "" : null }, `${c.name} (${c.slug})`)))),
+    h("p", { class: "muted small superadmin-note", style: "width:100%" }, "Superadmins see and manage every customer, only from the office network or with verified staff email, and must set up Microsoft Authenticator at first sign-in."),
     h("label", {}, "Active", h("select", { name: "active" }, h("option", { value: "1", selected: (u ? u.active : true) ? "" : null }, "yes"), h("option", { value: "0", selected: u && !u.active ? "" : null }, "no"))),
     u ? null : h("label", {}, "Initial password (blank = generate)", h("input", { name: "password", type: "password", autocomplete: "new-password" })),
     h("button", { class: "btn primary", type: "submit" }, u ? "Save" : "Create"),
-    u ? h("button", { class: "btn", type: "button", onclick: () => userForm(cid, depts, null, form) }, "Cancel") : null);
+    u ? h("button", { class: "btn", type: "button", onclick: () => userForm(customers, depts, null, form) }, "Cancel") : null);
+  show();
   form.onsubmit = async (e) => {
     e.preventDefault();
-    const body = { username: form.username.value.trim(), display_name: form.display_name.value.trim(), role: form.role.value, customer_id: cid,
-      department_ids: [...form.depts.selectedOptions].map(o => Number(o.value)), active: form.active.value === "1" };
+    const role = form.role.value;
+    const body = { username: form.username.value.trim(), display_name: form.display_name.value.trim(), role,
+      customer_ids: role === "customer_admin" ? [...form.custs.selectedOptions].map(o => Number(o.value)) : [],
+      department_ids: role === "department" ? [...form.depts.selectedOptions].map(o => Number(o.value)) : [],
+      active: form.active.value === "1" };
     if (!u && form.password.value) body.password = form.password.value;
+    if (role === "superadmin" && !confirm(`${u ? "Make" : "Create"} ${body.username} a superadmin? Superadmins can see every customer's recordings and manage everything.`)) return;
     try {
       if (u) { await api(`/api/admin/users/${u.id}`, { method: "PUT", body }); toast("Saved."); render(); }
       else { const r = await api("/api/admin/users", { method: "POST", body }); toast("User created."); await viewUsers($("#main")); showSecret($("#main .card:last-child > div"), body.username, r.initial_password); }
@@ -692,8 +744,8 @@ function userForm(cid, depts, u = null, existing = null) {
 
 /* ------------------------------------------------------------------ admin: audit */
 async function viewAudit(main) {
-  const picker = await customerPicker(() => viewAudit(main));
-  const cid = state.me.role === "superadmin" ? state.customerId : null;
+  const picker = await customerPicker(() => viewAudit(main), { allowAll: true });
+  const cid = state.customerId;
   const p = new URLSearchParams({ page: state.page }); if (cid) p.set("customer_id", cid);
   const data = await api(`/api/admin/audit?${p}`);
   const pages = Math.max(1, Math.ceil(data.total / 100));

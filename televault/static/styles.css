@@ -144,3 +144,4 @@ code { font-family: var(--mono); font-size: 13px; background: var(--tint); paddi
   .brand-sub, .who .muted { display: none; }
   .main { padding: 12px; }
 }
+td.wrap { white-space: normal; min-width: 180px; max-width: 360px; }

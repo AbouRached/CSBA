@@ -181,7 +181,7 @@ def summary(
 # ---------------------------------------------------------------- file access
 
 def _resolve(conn: sqlite3.Connection, p: Principal, rec_id: int) -> tuple[sqlite3.Row, Path]:
-    s_sql, s_params = scope_sql(conn, p, None if p.is_superadmin else p.customer_id)
+    s_sql, s_params = scope_sql(conn, p, None)
     row = conn.execute(
         f"SELECT r.*, c.root_path, c.volume_serial FROM recordings r JOIN customers c ON c.id = r.customer_id "
         f"WHERE r.id = ? AND {s_sql}",
@@ -289,7 +289,7 @@ def zip_download(
     cfg: Config = Depends(get_cfg),
 ):
     if body.ids:
-        s_sql, s_params = scope_sql(conn, p, None if p.is_superadmin else p.customer_id)
+        s_sql, s_params = scope_sql(conn, p, None)
         q = ",".join("?" * len(body.ids))
         rows = conn.execute(
             f"SELECT r.*, c.root_path, c.volume_serial FROM recordings r JOIN customers c ON c.id = r.customer_id "

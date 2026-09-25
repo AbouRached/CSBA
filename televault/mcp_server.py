@@ -37,7 +37,7 @@ from .config import APP_NAME, Config
 from .db import Database
 from .indexer import drive_state, index_customer, root_online, volume_serial
 from .parser import parse_filename
-from .scope import Principal, department_predicate, load_dept_rules, scope_sql
+from .scope import Principal, department_predicate, load_dept_rules, load_memberships, scope_sql
 from .security import iso, now_utc
 
 SUPPORTED_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
@@ -93,9 +93,10 @@ def _principal(conn: sqlite3.Connection, username: str) -> Principal:
     u = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
     if u is None:
         raise ToolError(f"no user {username!r}")
-    depts = [r["department_id"] for r in conn.execute("SELECT department_id FROM user_departments WHERE user_id = ?", (u["id"],))]
+    cids, depts = load_memberships(conn, u["id"], u["role"], u["customer_id"])
     return Principal(user_id=u["id"], username=u["username"], role=u["role"], customer_id=u["customer_id"],
-                     department_ids=depts, must_change_password=bool(u["must_change_password"]), mfa_ok=True)
+                     department_ids=depts, customer_ids=cids,
+                     must_change_password=bool(u["must_change_password"]), mfa_ok=True)
 
 
 def _int(v: Any, default: int, lo: int, hi: int) -> int:
@@ -255,14 +256,18 @@ class Tools:
         return out
 
     def list_users(self, conn, a):
-        q, params = "SELECT u.*, c.slug FROM users u LEFT JOIN customers c ON c.id = u.customer_id", []
-        if a.get("customer"):
-            q += " WHERE u.customer_id = ?"; params.append(_customer(conn, a["customer"])["id"])
+        only = _customer(conn, a["customer"])["id"] if a.get("customer") else None
+        slugs = {r["id"]: r["slug"] for r in conn.execute("SELECT id, slug FROM customers")}
         out = []
-        for u in conn.execute(q + " ORDER BY u.username", params):
-            depts = [r["name"] for r in conn.execute(
-                "SELECT d.name FROM departments d JOIN user_departments ud ON ud.department_id = d.id WHERE ud.user_id = ?", (u["id"],))]
-            out.append({"username": u["username"], "role": u["role"], "customer": u["slug"], "departments": depts,
+        for u in conn.execute("SELECT * FROM users ORDER BY username"):
+            cids, _ = load_memberships(conn, u["id"], u["role"], u["customer_id"])
+            if only is not None and only not in cids:
+                continue
+            depts = [f"{r['slug']}/{r['name']}" for r in conn.execute(
+                "SELECT d.name, c.slug FROM departments d JOIN customers c ON c.id = d.customer_id "
+                "JOIN user_departments ud ON ud.department_id = d.id WHERE ud.user_id = ?", (u["id"],))]
+            out.append({"username": u["username"], "role": u["role"], "customers": [slugs.get(c) for c in cids],
+                        "departments": depts,
                         "active": bool(u["active"]), "mfa_set_up": bool(u["mfa_enabled"]),
                         "must_change_password": bool(u["must_change_password"]), "failed_attempts": u["failed_attempts"],
                         "locked_until": u["locked_until"], "last_login": u["last_login"]})
@@ -326,16 +331,20 @@ class Tools:
         reasons = []
         if p.is_superadmin:
             reasons.append("superadmin sees every customer")
-        elif p.customer_id != r["customer_id"]:
-            reasons.append(f"recording belongs to customer {r['slug']}, user belongs to another customer")
+        elif r["customer_id"] not in p.customer_ids:
+            reasons.append(f"recording belongs to customer {r['slug']}, which is not one of the user's customers")
         elif p.role == "customer_admin":
             reasons.append("customer admin sees the whole customer drive")
         else:
-            rules = load_dept_rules(conn, p.department_ids)
-            if not rules:
+            if not p.department_ids:
                 reasons.append("department user without any department sees nothing")
-            for d_id, rule in zip(p.department_ids, rules):
+            for d_id in p.department_ids:
+                rule = load_dept_rules(conn, [d_id])[0]
                 name = conn.execute("SELECT name FROM departments WHERE id = ?", (d_id,)).fetchone()
+                if rule.customer_id != r["customer_id"]:
+                    reasons.append({"department": name["name"] if name else d_id,
+                                    "matches": ["belongs to another customer - its rules don't apply here"]})
+                    continue
                 hits = []
                 if r["party"] in rule.extensions:
                     hits.append(f"party {r['party']} is a department extension")
@@ -369,8 +378,9 @@ class Tools:
             matches = []
             for d in conn.execute("SELECT id, name FROM departments WHERE customer_id = ?", (c["id"],)):
                 pred, params = department_predicate(load_dept_rules(conn, [d["id"]]))
-                probe = conn.execute(f"SELECT 1 FROM (SELECT ? AS rec_type, ? AS target, ? AS party, ? AS rel_path) r WHERE {pred}",
-                                     [parsed.rec_type, parsed.target, parsed.party, name] + params).fetchone()
+                probe = conn.execute(
+                    f"SELECT 1 FROM (SELECT ? AS customer_id, ? AS rec_type, ? AS target, ? AS party, ? AS rel_path) r "
+                    f"WHERE {pred}", [c["id"], parsed.rec_type, parsed.target, parsed.party, name] + params).fetchone()
                 if probe:
                     matches.append(d["name"])
             out["departments_by_number"] = matches

@@ -24,7 +24,7 @@ from .deps import (client_ip, get_cfg, get_conn, get_db, require_admin, require_
 from .indexer import drive_state, root_online, volume_serial
 from .access import normalize_pattern
 from .mfa import reset_user_mfa
-from .scope import Principal
+from .scope import Principal, load_memberships
 from .security import destroy_user_sessions, hash_password, password_policy_error
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
@@ -55,8 +55,8 @@ def _clean_numbers(xs: list[str], what: str) -> list[str]:
     return sorted(set(out))
 
 
-def _own_customer(p: Principal, customer_id: int) -> None:
-    if not p.is_superadmin and p.customer_id != customer_id:
+def _own_customer(p: Principal, customer_id: int | None) -> None:
+    if not p.is_superadmin and customer_id not in p.customer_ids:
         raise HTTPException(403, "Not your customer.")
 
 
@@ -96,7 +96,8 @@ def list_customers(p: Principal = Depends(require_admin), conn: sqlite3.Connecti
     if p.is_superadmin:
         rows = conn.execute("SELECT * FROM customers ORDER BY name").fetchall()
     else:
-        rows = conn.execute("SELECT * FROM customers WHERE id = ?", (p.customer_id,)).fetchall()
+        q = ",".join("?" * len(p.customer_ids)) or "NULL"
+        rows = conn.execute(f"SELECT * FROM customers WHERE id IN ({q}) ORDER BY name", p.customer_ids).fetchall()
     out = []
     for r in rows:
         d = dict(r)
@@ -382,11 +383,15 @@ def _dept_json(r: sqlite3.Row) -> dict:
 @router.get("/departments")
 def list_departments(customer_id: int | None = None, p: Principal = Depends(require_admin),
                      conn: sqlite3.Connection = Depends(get_conn)):
-    cid = customer_id if p.is_superadmin else p.customer_id
-    if cid is None:
+    if customer_id is not None:
+        _own_customer(p, customer_id)
+        rows = conn.execute("SELECT * FROM departments WHERE customer_id = ? ORDER BY name", (customer_id,)).fetchall()
+    elif p.is_superadmin:
         rows = conn.execute("SELECT * FROM departments ORDER BY customer_id, name").fetchall()
     else:
-        rows = conn.execute("SELECT * FROM departments WHERE customer_id = ? ORDER BY name", (cid,)).fetchall()
+        q = ",".join("?" * len(p.customer_ids)) or "NULL"
+        rows = conn.execute(f"SELECT * FROM departments WHERE customer_id IN ({q}) ORDER BY customer_id, name",
+                            p.customer_ids).fetchall()
     return [_dept_json(r) for r in rows]
 
 
@@ -452,70 +457,110 @@ def delete_department(did: int, request: Request, p: Principal = Depends(require
 class UserIn(BaseModel):
     username: str
     display_name: str = Field(default="", max_length=120)
-    role: str  # customer_admin | department
-    customer_id: int | None = None
-    department_ids: list[int] = Field(default_factory=list, max_length=200)
+    role: str  # superadmin | customer_admin | department
+    customer_ids: list[int] = Field(default_factory=list, max_length=200)  # customer_admin: customers administered
+    customer_id: int | None = None  # legacy single-customer field; merged into customer_ids
+    department_ids: list[int] = Field(default_factory=list, max_length=200)  # department: may span customers
     active: bool = True
     password: str | None = None  # omitted => generated and returned once
 
 
-def _user_json(conn: sqlite3.Connection, r: sqlite3.Row) -> dict:
-    depts = [x["department_id"] for x in conn.execute(
-        "SELECT department_id FROM user_departments WHERE user_id = ?", (r["id"],))]
+def _manageable(conn: sqlite3.Connection, p: Principal, row: sqlite3.Row) -> bool:
+    """May `p` edit / reset this user? Superadmins: anyone. Customer admins: only department
+    users whose departments all belong to customers they administer (a user who also has
+    departments elsewhere is managed by staff, so one customer can't change another's access)."""
+    if p.is_superadmin:
+        return True
+    if p.role != "customer_admin" or row["role"] != "department":
+        return False
+    cids, dids = load_memberships(conn, row["id"], row["role"], row["customer_id"])
+    return bool(dids) and set(cids) <= set(p.customer_ids)
+
+
+def _user_json(conn: sqlite3.Connection, p: Principal, r: sqlite3.Row) -> dict:
+    cids, dids = load_memberships(conn, r["id"], r["role"], r["customer_id"])
     return {
         "id": r["id"], "username": r["username"], "display_name": r["display_name"], "role": r["role"],
-        "customer_id": r["customer_id"], "department_ids": depts, "active": bool(r["active"]),
+        "customer_ids": cids, "customer_id": cids[0] if len(cids) == 1 else None,
+        "department_ids": dids, "active": bool(r["active"]),
         "must_change_password": bool(r["must_change_password"]), "mfa_enabled": bool(r["mfa_enabled"]),
-        "last_login": r["last_login"],
-        "locked_until": r["locked_until"], "created_at": r["created_at"],
+        "last_login": r["last_login"], "locked_until": r["locked_until"], "created_at": r["created_at"],
+        "manageable": _manageable(conn, p, r) and r["id"] != p.user_id,
+        "is_self": r["id"] == p.user_id,
     }
 
 
-def _validate_user(conn: sqlite3.Connection, p: Principal, body: UserIn) -> tuple[int, list[int]]:
+def _validate_user(conn: sqlite3.Connection, p: Principal, body: UserIn) -> tuple[list[int], list[int]]:
+    """Check the requested role and memberships; returns (customer_ids, department_ids)."""
     if not _USERNAME.match(body.username):
         raise HTTPException(400, "Username: 3-64 chars, letters, digits, . _ @ -")
-    if body.role not in ("customer_admin", "department"):
-        raise HTTPException(400, "Role must be customer_admin or department.")
-    if not p.is_superadmin and body.role == "customer_admin":
-        raise HTTPException(403, "Only staff (superadmins) can create customer admins.")
-    cid = body.customer_id if p.is_superadmin else p.customer_id
-    if cid is None:
-        raise HTTPException(400, "customer_id is required.")
-    if conn.execute("SELECT 1 FROM customers WHERE id = ?", (cid,)).fetchone() is None:
-        raise HTTPException(404, "No such customer.")
-    dept_ids: list[int] = []
-    if body.role == "department":
-        if not body.department_ids:
-            raise HTTPException(400, "A department user needs at least one department.")
-        q = ",".join("?" * len(body.department_ids))
-        rows = conn.execute(
-            f"SELECT id FROM departments WHERE id IN ({q}) AND customer_id = ?", body.department_ids + [cid]
-        ).fetchall()
-        dept_ids = [r["id"] for r in rows]
-        if len(dept_ids) != len(set(body.department_ids)):
-            raise HTTPException(400, "One or more departments do not belong to this customer.")
-    return cid, dept_ids
+    if body.role not in ("superadmin", "customer_admin", "department"):
+        raise HTTPException(400, "Role must be superadmin, customer_admin or department.")
+    if body.role == "superadmin":
+        if not p.is_superadmin:
+            raise HTTPException(403, "Only superadmins can create or edit superadmins.")
+        return [], []
+    if body.role == "customer_admin":
+        if not p.is_superadmin:
+            raise HTTPException(403, "Only staff (superadmins) can create customer admins.")
+        cids = sorted(set(body.customer_ids) | ({body.customer_id} if body.customer_id else set()))
+        if not cids:
+            raise HTTPException(400, "A customer admin needs at least one customer.")
+        q = ",".join("?" * len(cids))
+        if conn.execute(f"SELECT COUNT(*) FROM customers WHERE id IN ({q})", cids).fetchone()[0] != len(cids):
+            raise HTTPException(404, "One or more customers do not exist.")
+        return cids, []
+    # department user
+    dids = sorted(set(body.department_ids))
+    if not dids:
+        raise HTTPException(400, "A department user needs at least one department.")
+    q = ",".join("?" * len(dids))
+    rows = conn.execute(f"SELECT id, customer_id FROM departments WHERE id IN ({q})", dids).fetchall()
+    if len(rows) != len(dids):
+        raise HTTPException(400, "One or more departments do not exist.")
+    if not p.is_superadmin and not {r["customer_id"] for r in rows} <= set(p.customer_ids):
+        raise HTTPException(403, "One or more departments belong to a customer you don't administer.")
+    return [], dids
+
+
+def _save_memberships(conn: sqlite3.Connection, uid: int, cids: list[int], dids: list[int]) -> None:
+    conn.execute("UPDATE users SET customer_id = NULL WHERE id = ?", (uid,))  # memberships are the source of truth
+    conn.execute("DELETE FROM user_customers WHERE user_id = ?", (uid,))
+    conn.execute("DELETE FROM user_departments WHERE user_id = ?", (uid,))
+    conn.executemany("INSERT INTO user_customers(user_id, customer_id) VALUES (?,?)", [(uid, c) for c in cids])
+    conn.executemany("INSERT INTO user_departments(user_id, department_id) VALUES (?,?)", [(uid, d) for d in dids])
+
+
+def _other_active_superadmins(conn: sqlite3.Connection, uid: int) -> int:
+    return conn.execute("SELECT COUNT(*) FROM users WHERE role = 'superadmin' AND active = 1 AND id <> ?",
+                        (uid,)).fetchone()[0]
+
+
+def _audit_customer(cids: list[int]) -> int | None:
+    return cids[0] if len(cids) == 1 else None
 
 
 @router.get("/users")
 def list_users(customer_id: int | None = None, p: Principal = Depends(require_admin),
                conn: sqlite3.Connection = Depends(get_conn)):
-    if p.is_superadmin:
-        if customer_id is None:
-            rows = conn.execute("SELECT * FROM users ORDER BY customer_id, username").fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM users WHERE customer_id = ? ORDER BY username", (customer_id,)).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM users WHERE customer_id = ? AND role <> 'superadmin' ORDER BY username", (p.customer_id,)
-        ).fetchall()
-    return [_user_json(conn, r) for r in rows]
+    rows = conn.execute("SELECT * FROM users ORDER BY role, username").fetchall()
+    out = []
+    for r in rows:
+        cids, _ = load_memberships(conn, r["id"], r["role"], r["customer_id"])
+        if not p.is_superadmin:
+            # customer admins see the users of their customers (never superadmins)
+            if r["role"] == "superadmin" or not set(cids) & set(p.customer_ids):
+                continue
+        if customer_id is not None and customer_id not in cids:
+            continue
+        out.append(_user_json(conn, p, r))
+    return out
 
 
 @router.post("/users")
 def create_user(body: UserIn, request: Request, p: Principal = Depends(require_admin_stepup),
                 conn: sqlite3.Connection = Depends(get_conn), cfg: Config = Depends(get_cfg)):
-    cid, dept_ids = _validate_user(conn, p, body)
+    cids, dids = _validate_user(conn, p, body)
     pw = body.password or _gen_password()
     err = password_policy_error(pw, cfg)
     if err:
@@ -523,16 +568,15 @@ def create_user(body: UserIn, request: Request, p: Principal = Depends(require_a
     try:
         cur = conn.execute(
             "INSERT INTO users(customer_id, username, password_hash, role, display_name, must_change_password, active) "
-            "VALUES (?,?,?,?,?,1,?)",
-            (cid, body.username, hash_password(pw), body.role, body.display_name.strip(), int(body.active)),
+            "VALUES (NULL,?,?,?,?,1,?)",
+            (body.username, hash_password(pw), body.role, body.display_name.strip(), int(body.active)),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Username already exists.")
     uid = cur.lastrowid
-    conn.executemany("INSERT INTO user_departments(user_id, department_id) VALUES (?,?)",
-                     [(uid, d) for d in dept_ids])
-    audit.log(conn, "admin.user.create", user_id=p.user_id, username=p.username, customer_id=cid,
-              ip=client_ip(request), detail=f"{body.username} role={body.role} depts={dept_ids}")
+    _save_memberships(conn, uid, cids, dids)
+    audit.log(conn, "admin.user.create", user_id=p.user_id, username=p.username, customer_id=_audit_customer(cids),
+              ip=client_ip(request), detail=f"{body.username} role={body.role} customers={cids} depts={dids}")
     # The initial password is shown exactly once, to the admin who created the account.
     return {"id": uid, "initial_password": pw}
 
@@ -541,37 +585,45 @@ def create_user(body: UserIn, request: Request, p: Principal = Depends(require_a
 def update_user(uid: int, body: UserIn, request: Request, p: Principal = Depends(require_admin_stepup),
                 conn: sqlite3.Connection = Depends(get_conn)):
     row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    if row is None or row["role"] == "superadmin":
+    if row is None or (not p.is_superadmin and row["role"] == "superadmin"):
         raise HTTPException(404, "No such user.")
-    _own_customer(p, row["customer_id"])
-    if not p.is_superadmin and row["role"] == "customer_admin":
-        raise HTTPException(403, "Only staff (superadmins) can edit customer admins.")
-    body.customer_id = row["customer_id"]
-    cid, dept_ids = _validate_user(conn, p, body)
+    if not _manageable(conn, p, row):
+        raise HTTPException(403, "Only staff (superadmins) can edit this user.")
+    if uid == p.user_id and (body.role != row["role"] or not body.active):
+        raise HTTPException(409, "You can't change the role of, or disable, your own account.")
+    if row["role"] == "superadmin" and (body.role != "superadmin" or not body.active) \
+            and _other_active_superadmins(conn, uid) == 0:
+        raise HTTPException(409, "This is the last active superadmin; create another one first.")
+    cids, dids = _validate_user(conn, p, body)
     try:
         conn.execute("UPDATE users SET username=?, display_name=?, role=?, active=? WHERE id=?",
                      (body.username, body.display_name.strip(), body.role, int(body.active), uid))
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Username already exists.")
-    conn.execute("DELETE FROM user_departments WHERE user_id = ?", (uid,))
-    conn.executemany("INSERT INTO user_departments(user_id, department_id) VALUES (?,?)",
-                     [(uid, d) for d in dept_ids])
-    if not body.active:
+    _save_memberships(conn, uid, cids, dids)
+    if not body.active or body.role != row["role"]:
         destroy_user_sessions(conn, uid)
-    audit.log(conn, "admin.user.update", user_id=p.user_id, username=p.username, customer_id=cid,
-              ip=client_ip(request), detail=f"{body.username} role={body.role} active={body.active} depts={dept_ids}")
+    audit.log(conn, "admin.user.update", user_id=p.user_id, username=p.username, customer_id=_audit_customer(cids),
+              ip=client_ip(request),
+              detail=f"{body.username} role={row['role']}->{body.role} active={body.active} customers={cids} depts={dids}")
     return {"ok": True}
+
+
+def _reset_target(conn: sqlite3.Connection, p: Principal, uid: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
+    if row is None or (not p.is_superadmin and row["role"] == "superadmin"):
+        raise HTTPException(404, "No such user.")
+    if uid == p.user_id:
+        raise HTTPException(409, "Use the Password page for your own account.")
+    if not _manageable(conn, p, row):
+        raise HTTPException(403, "Only staff (superadmins) can reset this user.")
+    return row
 
 
 @router.post("/users/{uid}/reset-password")
 def reset_password(uid: int, request: Request, p: Principal = Depends(require_admin_stepup),
                    conn: sqlite3.Connection = Depends(get_conn)):
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    if row is None or row["role"] == "superadmin":
-        raise HTTPException(404, "No such user.")
-    _own_customer(p, row["customer_id"])
-    if not p.is_superadmin and row["role"] == "customer_admin":
-        raise HTTPException(403, "Only staff (superadmins) can reset customer admins.")
+    row = _reset_target(conn, p, uid)
     pw = _gen_password()
     conn.execute(
         "UPDATE users SET password_hash=?, must_change_password=1, failed_attempts=0, locked_until=NULL WHERE id=?",
@@ -586,14 +638,8 @@ def reset_password(uid: int, request: Request, p: Principal = Depends(require_ad
 @router.post("/users/{uid}/reset-mfa")
 def reset_mfa(uid: int, request: Request, p: Principal = Depends(require_admin_stepup),
               conn: sqlite3.Connection = Depends(get_conn)):
-    """Lost or replaced phone: the user must scan a new QR code at next sign-in.
-    Superadmin authenticators are reset only on the console (cli reset-mfa)."""
-    row = conn.execute("SELECT * FROM users WHERE id = ?", (uid,)).fetchone()
-    if row is None or row["role"] == "superadmin":
-        raise HTTPException(404, "No such user.")
-    _own_customer(p, row["customer_id"])
-    if not p.is_superadmin and row["role"] == "customer_admin":
-        raise HTTPException(403, "Only staff (superadmins) can reset customer admins.")
+    """Lost or replaced phone: the user must scan a new QR code at next sign-in."""
+    row = _reset_target(conn, p, uid)
     reset_user_mfa(conn, uid)
     audit.log(conn, "admin.user.reset_mfa", user_id=p.user_id, username=p.username,
               customer_id=row["customer_id"], ip=client_ip(request), detail=row["username"])
@@ -693,10 +739,14 @@ def audit_log(customer_id: int | None = None, action: str | None = None, page: i
               p: Principal = Depends(require_admin), conn: sqlite3.Connection = Depends(get_conn)):
     page = max(1, min(page, 100000))
     clauses, params = [], []
-    cid = customer_id if p.is_superadmin else p.customer_id
-    if cid is not None:
+    if customer_id is not None:
+        _own_customer(p, customer_id)
         clauses.append("customer_id = ?")
-        params.append(cid)
+        params.append(customer_id)
+    elif not p.is_superadmin:
+        q = ",".join("?" * len(p.customer_ids)) or "NULL"
+        clauses.append(f"customer_id IN ({q})")
+        params.extend(p.customer_ids)
     if action:
         clauses.append("action LIKE ?")
         params.append(action.replace("%", "") + "%")

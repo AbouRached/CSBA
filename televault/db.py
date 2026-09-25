@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS access_grants (
 );
 CREATE INDEX IF NOT EXISTS idx_access_grants_cust ON access_grants(customer_id, id DESC);
 
+-- Customers a customer_admin administers (a user may administer several). Department
+-- users get their customers through their departments (user_departments).
+-- users.customer_id is the legacy single-customer column; it still counts as a membership.
+CREATE TABLE IF NOT EXISTS user_customers (
+    user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    customer_id INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    PRIMARY KEY (user_id, customer_id)
+);
+
 -- Tokens for the local MCP endpoint (troubleshooting / development tools). Only the SHA-256
 -- of the token is stored; the token itself is shown once, when a superadmin creates it.
 CREATE TABLE IF NOT EXISTS mcp_tokens (
