@@ -91,8 +91,12 @@ icacls $BackupDir /inheritance:r /grant:r "Administrators:(OI)(CI)F" "SYSTEM:(OI
 $bAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\scripts\backup.ps1`" -Dest `"$BackupDir`"" -WorkingDirectory $root
 $bTrigger = New-ScheduledTaskTrigger -Daily -At 2am
 $bPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+# StartWhenAvailable: if the PC was off (or rebooting) at 02:00, run the missed backup at next start.
+$bSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 4) `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 10)
 Unregister-ScheduledTask -TaskName "TeleVault Backup" -Confirm:$false -ErrorAction SilentlyContinue
-Register-ScheduledTask -TaskName "TeleVault Backup" -Action $bAction -Trigger $bTrigger -Principal $bPrincipal -Description "Nightly TeleVault backup" -ErrorAction Stop | Out-Null
+Register-ScheduledTask -TaskName "TeleVault Backup" -Action $bAction -Trigger $bTrigger -Principal $bPrincipal -Settings $bSettings `
+    -Description "Nightly TeleVault backup" -ErrorAction Stop | Out-Null
 Write-Host "Nightly backup task registered -> $BackupDir"
 
 # 5b. Grant worker: applies "Grant read-only access" requests from the Customers page.
