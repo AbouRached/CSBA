@@ -1,0 +1,16 @@
+# Cloudflare Tunnel for TeleVault.
+# Copy to %USERPROFILE%\.cloudflared\config.yml, fill <TUNNEL_ID> and the hostname.
+#   cloudflared tunnel login
+#   cloudflared tunnel create televault
+#   cloudflared tunnel route dns televault televault.example.com
+#   cloudflared service install        (runs the tunnel at boot as a Windows service)
+tunnel: <TUNNEL_ID>
+credentials-file: C:\Users\<USER>\.cloudflared\<TUNNEL_ID>.json
+
+ingress:
+  - hostname: televault.example.com
+    service: https://localhost:8443
+    originRequest:
+      # TeleVault uses a self-signed cert on the origin; traffic never leaves this PC.
+      noTLSVerify: true
+  - service: http_status:404

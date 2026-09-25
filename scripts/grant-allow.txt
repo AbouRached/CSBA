@@ -1,0 +1,4 @@
+# Folders on the Windows drive (C:) that the TeleVault Grant Worker may give the service
+# account read-only access to. Customer drives (D:, E:, J: ...) need no entry here.
+# One folder per line; subfolders are included. Only administrators can edit this file.
+# (empty: the demo folder was removed before launch)

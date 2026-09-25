@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+config.json
+*.log
+# operator branding is deployed locally, not published
+televault/static/brand/
