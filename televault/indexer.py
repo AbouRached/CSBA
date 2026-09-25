@@ -108,8 +108,12 @@ def index_customer(db: Database, cfg: Config, customer_id: int) -> dict:
                                       rec_ts, uniqueid, size, mtime, empty, seen_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(customer_id, rel_path) DO UPDATE SET
+                   filename=excluded.filename, rec_type=excluded.rec_type, target=excluded.target,
+                   party=excluded.party, rec_ts=excluded.rec_ts, uniqueid=excluded.uniqueid,
                    size=excluded.size, mtime=excluded.mtime, empty=excluded.empty,
                    seen_at=excluded.seen_at""",
+            # parsed fields are refreshed too, so a parser improvement (e.g. a newly known
+            # recording type) corrects rows that were indexed earlier as 'unknown'
             batch,
         )
         added += max(0, cur.rowcount)

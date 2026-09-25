@@ -337,7 +337,7 @@ class Tools:
                 hits = []
                 if r["party"] in rule.extensions:
                     hits.append(f"party {r['party']} is a department extension")
-                if r["rec_type"] in ("external", "internal") and r["target"] in rule.extensions:
+                if r["rec_type"] in ("external", "exten", "internal") and r["target"] in rule.extensions:
                     hits.append(f"{r['rec_type']} target {r['target']} is a department extension")
                 if r["rec_type"] == "q" and r["target"] in rule.queues:
                     hits.append(f"queue {r['target']} is a department queue")

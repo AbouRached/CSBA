@@ -243,8 +243,10 @@ def cmd_remove_customer(args) -> int:
             return 1
         # sessions/user_departments/departments/recordings/index_runs/access_grants cascade
         c.execute("DELETE FROM customers WHERE id = ?", (cust["id"],))
-        c.execute("INSERT INTO audit_log(username, customer_id, action, detail) VALUES ('console', ?, 'cli.customer.remove', ?)",
-                  (cust["id"], f"{cust['slug']} root={cust['root_path']} users={users} depts={depts} index_rows={n_rec}"))
+        from . import audit
+        audit.configure(cfg.audit_to_eventlog)  # also mirror to the Windows Event Log
+        audit.log(c, "cli.customer.remove", username="console", customer_id=cust["id"],
+                  detail=f"{cust['slug']} root={cust['root_path']} users={users} depts={depts} index_rows={n_rec}")
     print(f"Removed customer '{args.slug}' ({len(users)} users, {len(depts)} departments, {n_rec} index rows). Files untouched.")
     return 0
 

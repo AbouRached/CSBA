@@ -66,13 +66,14 @@ def department_predicate(rules: list[DeptRule]) -> tuple[str, list]:
 
         type      target            party
         external  the EXTENSION     outside caller
+        exten     the EXTENSION     caller (outside CID or an extension) - older recordcheck
         internal  callee EXTENSION  caller EXTENSION
         out       dialled number    the EXTENSION
         q         queue number      caller (outside CID or an extension)
         in        DID               outside caller (or queue member ext)
 
       party IN extensions
-      OR (rec_type IN ('external','internal') AND target IN extensions)
+      OR (rec_type IN ('external','exten','internal') AND target IN extensions)
       OR (rec_type='q'  AND target IN queues)
       OR (rec_type='in' AND target IN dids)
       OR rel_path is inside one of the department's folders
@@ -100,7 +101,7 @@ def department_predicate(rules: list[DeptRule]) -> tuple[str, list]:
         q = ",".join("?" * len(exts))
         clauses.append(f"r.party IN ({q})")
         params.extend(sorted(exts))
-        clauses.append(f"(r.rec_type IN ('external','internal') AND r.target IN ({q}))")
+        clauses.append(f"(r.rec_type IN ('external','exten','internal') AND r.target IN ({q}))")
         params.extend(sorted(exts))
     if queues:
         q = ",".join("?" * len(queues))

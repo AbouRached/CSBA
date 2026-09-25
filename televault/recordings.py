@@ -65,7 +65,7 @@ def _filter_sql(f: Filters) -> tuple[str, list]:
     if f.ext:
         if not _DIGITS.match(f.ext):
             raise HTTPException(400, "bad extension")
-        clauses.append("(r.party = ? OR (r.rec_type IN ('external','internal') AND r.target = ?))")
+        clauses.append("(r.party = ? OR (r.rec_type IN ('external','exten','internal') AND r.target = ?))")
         params.extend([f.ext, f.ext])
     if f.number:
         n = f.number.strip()

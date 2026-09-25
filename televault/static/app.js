@@ -212,7 +212,7 @@ async function viewRecordings(main) {
     picker,
     h("label", {}, "From", h("input", { type: "date", name: "date_from", value: f.date_from || "" })),
     h("label", {}, "To", h("input", { type: "date", name: "date_to", value: f.date_to || "" })),
-    h("label", {}, "Type", h("select", { name: "type" }, ...[["", "Any"], ["in", "Inbound"], ["out", "Outbound"], ["q", "Queue"], ["external", "External"], ["internal", "Internal"], ["unknown", "Unparsed"]].map(([v, l]) => h("option", { value: v, selected: (f.type || "") === v ? "" : null }, l)))),
+    h("label", {}, "Type", h("select", { name: "type" }, ...[["", "Any"], ["in", "Inbound"], ["out", "Outbound"], ["q", "Queue"], ["external", "External"], ["exten", "To extension"], ["internal", "Internal"], ["unknown", "Unparsed"]].map(([v, l]) => h("option", { value: v, selected: (f.type || "") === v ? "" : null }, l)))),
     h("label", {}, "Extension", h("input", { name: "ext", value: f.ext || "", placeholder: "e.g. 436", inputmode: "numeric" })),
     h("label", {}, "Number contains", h("input", { name: "number", value: f.number || "", placeholder: "caller / DID / dialled", inputmode: "numeric" })),
     h("label", { class: "grow" }, "Filename contains", h("input", { name: "q", value: f.q || "" })),

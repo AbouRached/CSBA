@@ -5,8 +5,9 @@ FreePBX `recordcheck` builds every filename as
     <type>-<target>-<party>-<YYYYMMDD>-<HHMMSS>-<uniqueid>.<ext>
 
 Field   Meaning
-type    external | in | out | q | internal | parked | conf
-target  DID (in), queue number (q), dialled number (out), extension (external/internal)
+type    external | exten | in | out | q | internal | parked | conf
+        (exten: a call to an extension, as written by older FreePBX recordcheck versions)
+target  DID (in), queue number (q), dialled number (out), extension (external/exten/internal)
 party   the local extension, or the outside CID when there is no local user
 uniqueid  epoch.sequence of the *recorded channel*
 
@@ -19,7 +20,7 @@ import re
 from dataclasses import dataclass
 from datetime import datetime
 
-KNOWN_TYPES = {"external", "in", "out", "q", "internal", "parked", "conf"}
+KNOWN_TYPES = {"external", "exten", "in", "out", "q", "internal", "parked", "conf"}
 
 # type-target-party-YYYYMMDD-HHMMSS-uniqueid.ext
 # target and party may themselves contain no hyphen in FreePBX output, but be tolerant:

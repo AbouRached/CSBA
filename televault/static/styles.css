@@ -70,7 +70,7 @@ input:focus, select:focus, textarea:focus { outline: 2px solid var(--focus); out
 .badge { display: inline-block; padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .3px; }
 .badge.in { background: #e3f4f2; color: #16645c; } .badge.out { background: #fdf1d8; color: #7a5200; }
 .badge.q { background: #e8e9fb; color: #3b3fa0; } .badge.external { background: #e9f0fb; color: #1f4d8f; }
-.badge.internal { background: #eef1f5; color: #4a5568; } .badge.unknown { background: #f5e6e6; color: #8a2f2f; }
+.badge.internal { background: #eef1f5; color: #4a5568; } .badge.exten { background: #e6f2ea; color: #1f6b3a; } .badge.unknown { background: #f5e6e6; color: #8a2f2f; }
 @media (prefers-color-scheme: dark) { .badge { filter: brightness(.85) saturate(1.2); } }
 .tag-empty { color: var(--muted); font-size: 12px; }
 
