@@ -16,11 +16,12 @@ import time
 from pathlib import Path
 
 from .config import Config
-from .db import Database
+from .db import Database, connect
 from .parser import fallback_from_mtime, parse_filename
 from .security import iso, now_utc
 
 log = logging.getLogger("televault.indexer")
+BATCH = 5000  # rows per write transaction: keeps each database write lock short
 
 
 def root_online(root: str) -> bool:
@@ -89,76 +90,93 @@ def index_customer(db: Database, cfg: Config, customer_id: int) -> dict:
                       (iso(now_utc()), msg[:500], run_id))
         return {"status": "error", "message": msg}
 
-    # Per-run marker: the timestamp alone is per-second, so two runs in the same second could
-    # not tell old rows from new. The zero-padded run id sorts after it (and after any older
-    # marker without one), so "seen_at < marker" means exactly "not seen in this run".
-    seen_marker = f"{started}#{run_id:012d}"
+    # Large drives (hundreds of thousands of files) must never hold the database's write lock
+    # for the length of a walk - sign-ins and the audit log would stall behind it. So:
+    #   1. list the drive into a TEMP table (temp tables live outside the main database file,
+    #      so writing them takes no lock on it);
+    #   2. write only new / changed / still-unparsed rows, BATCH at a time, committing each;
+    #   3. delete rows whose file is gone, in one short statement.
+    # An unchanged drive therefore costs one walk and almost no writes.
     exts = set(cfg.audio_extensions)
-    added = 0
-    seen = 0
     walk_errors: list[OSError] = []
-    batch: list[tuple] = []
-
-    def flush(conn: sqlite3.Connection):
-        nonlocal added
-        if not batch:
-            return
-        cur = conn.executemany(
-            """INSERT INTO recordings(customer_id, rel_path, filename, rec_type, target, party,
-                                      rec_ts, uniqueid, size, mtime, empty, seen_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(customer_id, rel_path) DO UPDATE SET
-                   filename=excluded.filename, rec_type=excluded.rec_type, target=excluded.target,
-                   party=excluded.party, rec_ts=excluded.rec_ts, uniqueid=excluded.uniqueid,
-                   size=excluded.size, mtime=excluded.mtime, empty=excluded.empty,
-                   seen_at=excluded.seen_at""",
-            # parsed fields are refreshed too, so a parser improvement (e.g. a newly known
-            # recording type) corrects rows that were indexed earlier as 'unknown'
-            batch,
-        )
-        added += max(0, cur.rowcount)
-        batch.clear()
-
+    seen = added = updated = removed = 0
+    conn = connect(db.db_path)
     try:
-        with db.conn() as c:
-            before = c.execute(
-                "SELECT COUNT(*) FROM recordings WHERE customer_id = ?", (customer_id,)
-            ).fetchone()[0]
-            for rel, fn, size, mtime in _walk_audio(Path(root), exts, walk_errors):
-                seen += 1
-                parsed = parse_filename(fn) or fallback_from_mtime(mtime)
-                batch.append(
-                    (
-                        customer_id, rel, fn, parsed.rec_type, parsed.target, parsed.party,
-                        parsed.rec_ts, parsed.uniqueid, size, mtime,
-                        1 if size <= cfg.empty_file_bytes else 0, seen_marker,
-                    )
-                )
-                if len(batch) >= 1000:
-                    flush(c)
-            flush(c)
-            if walk_errors:
-                # Some folders were unreadable: "not seen" may just mean "could not look".
-                removed = 0
-                log.warning("customer %s: %d unreadable folder(s); keeping unseen rows", cust["slug"], len(walk_errors))
-            else:
-                removed = c.execute(
-                    "DELETE FROM recordings WHERE customer_id = ? AND seen_at < ?",
-                    (customer_id, seen_marker),
-                ).rowcount
-            after = c.execute(
-                "SELECT COUNT(*) FROM recordings WHERE customer_id = ?", (customer_id,)
-            ).fetchone()[0]
-            new_rows = max(0, after - before + removed)
-            c.execute(
-                """UPDATE index_runs SET finished_at=?, status=?, files_seen=?, files_added=?,
-                                         files_removed=?, message=? WHERE id=?""",
-                (iso(now_utc()), "partial" if walk_errors else "ok", seen, new_rows, removed,
-                 f"{len(walk_errors)} unreadable folder(s)" if walk_errors else "", run_id),
-            )
-        log.info("customer %s: seen=%d new=%d removed=%d", cust["slug"], seen, new_rows, removed)
-        return {"status": "ok", "seen": seen, "added": new_rows, "removed": removed}
+        conn.execute("CREATE TEMP TABLE IF NOT EXISTS walk "
+                     "(rel_path TEXT PRIMARY KEY, filename TEXT NOT NULL, size INTEGER NOT NULL, mtime REAL NOT NULL)")
+        conn.execute("DELETE FROM temp.walk")
+        conn.commit()
+        buf: list[tuple] = []
+        for rel, fn, size, mtime in _walk_audio(Path(root), exts, walk_errors):
+            seen += 1
+            buf.append((rel, fn, size, mtime))
+            if len(buf) >= BATCH:
+                conn.executemany("INSERT OR REPLACE INTO temp.walk VALUES (?,?,?,?)", buf)
+                conn.commit()
+                buf.clear()
+        if buf:
+            conn.executemany("INSERT OR REPLACE INTO temp.walk VALUES (?,?,?,?)", buf)
+            conn.commit()
+
+        last = 0
+        while True:
+            rows = conn.execute(
+                """SELECT w.rowid AS wid, w.rel_path, w.filename, w.size, w.mtime,
+                          r.id AS rid, r.size AS rsize, r.mtime AS rmtime
+                   FROM temp.walk w
+                   LEFT JOIN recordings r ON r.customer_id = ? AND r.rel_path = w.rel_path
+                   WHERE w.rowid > ? AND (r.id IS NULL OR r.size != w.size OR r.mtime != w.mtime
+                                          OR r.rec_type = 'unknown')
+                   ORDER BY w.rowid LIMIT ?""", (customer_id, last, BATCH)).fetchall()
+            if not rows:
+                break
+            last = rows[-1]["wid"]
+            batch = []
+            for x in rows:
+                parsed = parse_filename(x["filename"]) or fallback_from_mtime(x["mtime"])
+                unchanged = x["rid"] is not None and x["rsize"] == x["size"] and x["rmtime"] == x["mtime"]
+                if unchanged and not parsed.parsed:
+                    continue  # still not parseable and nothing changed: leave it alone
+                batch.append((customer_id, x["rel_path"], x["filename"], parsed.rec_type, parsed.target,
+                              parsed.party, parsed.rec_ts, parsed.uniqueid, x["size"], x["mtime"],
+                              1 if x["size"] <= cfg.empty_file_bytes else 0, started))
+                if x["rid"] is None:
+                    added += 1
+                else:
+                    updated += 1
+            if batch:
+                # Parsed fields are refreshed on update too, so a parser improvement (e.g. a
+                # newly known recording type) corrects rows indexed earlier as 'unknown'.
+                conn.executemany(
+                    """INSERT INTO recordings(customer_id, rel_path, filename, rec_type, target, party,
+                                              rec_ts, uniqueid, size, mtime, empty, seen_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(customer_id, rel_path) DO UPDATE SET
+                           filename=excluded.filename, rec_type=excluded.rec_type, target=excluded.target,
+                           party=excluded.party, rec_ts=excluded.rec_ts, uniqueid=excluded.uniqueid,
+                           size=excluded.size, mtime=excluded.mtime, empty=excluded.empty,
+                           seen_at=excluded.seen_at""", batch)
+                conn.commit()
+
+        if walk_errors:
+            # Some folders were unreadable: "not seen" may just mean "could not look".
+            log.warning("customer %s: %d unreadable folder(s); keeping unseen rows", cust["slug"], len(walk_errors))
+        else:
+            removed = conn.execute(
+                "DELETE FROM recordings WHERE customer_id = ? AND rel_path NOT IN (SELECT rel_path FROM temp.walk)",
+                (customer_id,)).rowcount
+            conn.commit()
+        note = f"{len(walk_errors)} unreadable folder(s)" if walk_errors else (f"{updated} updated" if updated else "")
+        conn.execute(
+            """UPDATE index_runs SET finished_at=?, status=?, files_seen=?, files_added=?,
+                                     files_removed=?, message=? WHERE id=?""",
+            (iso(now_utc()), "partial" if walk_errors else "ok", seen, added, removed, note, run_id))
+        conn.execute("DELETE FROM temp.walk")
+        conn.commit()
+        log.info("customer %s: seen=%d new=%d updated=%d removed=%d", cust["slug"], seen, added, updated, removed)
+        return {"status": "ok", "seen": seen, "added": added, "updated": updated, "removed": removed}
     except Exception as e:  # noqa: BLE001
+        conn.rollback()
         log.exception("index failed for %s", cust["slug"])
         with db.conn() as c:
             c.execute(
@@ -166,6 +184,8 @@ def index_customer(db: Database, cfg: Config, customer_id: int) -> dict:
                 (iso(now_utc()), str(e)[:500], run_id),
             )
         return {"status": "error", "message": str(e)}
+    finally:
+        conn.close()
 
 
 def index_all(db: Database, cfg: Config) -> list[dict]:
