@@ -35,7 +35,7 @@ from starlette.routing import Route
 from . import __version__, audit, grants
 from .config import APP_NAME, Config
 from .db import Database
-from .indexer import index_customer, root_online
+from .indexer import drive_state, index_customer, root_online, volume_serial
 from .parser import parse_filename
 from .scope import Principal, department_predicate, load_dept_rules, scope_sql
 from .security import iso, now_utc
@@ -182,6 +182,8 @@ class Tools:
             customers.append({
                 "slug": c["slug"], "enabled": bool(c["enabled"]), "root": c["root_path"],
                 "online": root_online(c["root_path"]),
+                "drive_state": drive_state(c["root_path"], c["volume_serial"]),
+                "volume_serial": {"bound": c["volume_serial"], "current": volume_serial(c["root_path"])},
                 "recordings": conn.execute("SELECT COUNT(*) FROM recordings WHERE customer_id = ?", (c["id"],)).fetchone()[0],
                 "last_index": dict(last) if last else None, "disk": disk,
                 "service_access": grants.access_status(c["root_path"], self.cfg),

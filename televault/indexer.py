@@ -32,6 +32,38 @@ def root_online(root: str) -> bool:
         return False
 
 
+def volume_serial(path: str) -> str | None:
+    """Serial number of the volume holding `path` (e.g. '88E2E9C6'), or None if unknown.
+    Drive letters can move between disks (a drive missing at boot, a new USB disk); the
+    serial identifies the actual disk, so a customer can never be served another's drive."""
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        mount = ctypes.create_unicode_buffer(261)
+        if not k32.GetVolumePathNameW(ctypes.c_wchar_p(str(path)), mount, 261):
+            return None
+        serial = wintypes.DWORD()
+        if not k32.GetVolumeInformationW(mount, None, 0, ctypes.byref(serial), None, None, None, 0):
+            return None
+        return f"{serial.value:08X}"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def drive_state(root: str, expected_serial: str | None) -> str:
+    """'online', 'offline', or 'wrong_drive' (a different disk now sits at this path)."""
+    if not root_online(root):
+        return "offline"
+    if expected_serial:
+        current = volume_serial(root)
+        if current and current != expected_serial:
+            return "wrong_drive"
+    return "online"
+
+
 def _walk_audio(root: Path, exts: set[str], errors: list | None = None):
     """Yield (rel_path, filename, size, mtime) for every audio file under root.
     Folders that cannot be read are appended to `errors` (and logged)."""
@@ -76,6 +108,24 @@ def index_customer(db: Database, cfg: Config, customer_id: int) -> dict:
                 (iso(now_utc()), msg, run_id),
             )
         return {"status": "offline", "message": msg}
+
+    # Right disk? Bind on first sight; afterwards a different disk at this path is refused
+    # (its recordings would otherwise be indexed - and shown - as this customer's).
+    current = volume_serial(root)
+    if cust["volume_serial"] and current and current != cust["volume_serial"]:
+        msg = (f"different disk at {root}: volume serial {current}, expected {cust['volume_serial']} - "
+               f"not indexing; check the drive letters (or re-save the customer if the disk was replaced)")
+        log.error("customer %s: %s", cust["slug"], msg)
+        with db.conn() as c:
+            c.execute("UPDATE index_runs SET finished_at=?, status='wrong_drive', message=? WHERE id=?",
+                      (iso(now_utc()), msg[:500], run_id))
+            from . import audit
+            audit.log(c, "system.drive.mismatch", username="indexer", customer_id=customer_id, detail=msg)
+        return {"status": "wrong_drive", "message": msg}
+    if current and not cust["volume_serial"]:
+        with db.conn() as c:
+            c.execute("UPDATE customers SET volume_serial = ? WHERE id = ?", (current, customer_id))
+        log.info("customer %s: bound to volume %s", cust["slug"], current)
 
     # A root that exists but cannot be listed (service account lacks rights) is an error,
     # not an empty drive: leave the index exactly as it is.

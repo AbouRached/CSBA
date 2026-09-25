@@ -21,7 +21,7 @@ from . import audit, grants
 from .config import Config
 from .deps import (client_ip, get_cfg, get_conn, get_db, require_admin, require_admin_stepup, require_superadmin,
                    require_superadmin_stepup)
-from .indexer import root_online
+from .indexer import drive_state, root_online, volume_serial
 from .access import normalize_pattern
 from .mfa import reset_user_mfa
 from .scope import Principal
@@ -100,7 +100,10 @@ def list_customers(p: Principal = Depends(require_admin), conn: sqlite3.Connecti
     out = []
     for r in rows:
         d = dict(r)
-        d["online"] = root_online(r["root_path"])
+        d["drive_state"] = drive_state(r["root_path"], r["volume_serial"])
+        d["online"] = d["drive_state"] == "online"
+        if d["drive_state"] == "wrong_drive":
+            d["current_serial"] = volume_serial(r["root_path"])
         d["recordings"] = conn.execute("SELECT COUNT(*) FROM recordings WHERE customer_id = ?", (r["id"],)).fetchone()[0]
         lr = conn.execute(
             "SELECT started_at, finished_at, status, files_seen, files_added, files_removed, message "
@@ -120,8 +123,8 @@ def create_customer(body: CustomerIn, request: Request, p: Principal = Depends(r
     root = _check_root(conn, body.root_path)
     try:
         cur = conn.execute(
-            "INSERT INTO customers(slug, name, root_path, enabled) VALUES (?,?,?,?)",
-            (body.slug, body.name.strip(), root, int(body.enabled)),
+            "INSERT INTO customers(slug, name, root_path, enabled, volume_serial) VALUES (?,?,?,?,?)",
+            (body.slug, body.name.strip(), root, int(body.enabled), volume_serial(root)),
         )
     except sqlite3.IntegrityError:
         raise HTTPException(409, "Slug already exists.")
@@ -170,10 +173,31 @@ def update_customer(cid: int, body: CustomerIn, request: Request, p: Principal =
               customer_id=cid, ip=client_ip(request),
               detail=f"{body.slug} root {old['root_path']} -> {root} enabled={body.enabled}")
     if _norm_root(old["root_path"]) != _norm_root(root):
+        # A deliberate move to another folder/disk: bind to the disk there now (or at the
+        # next index if it is offline). Other edits (name, enabled) never touch the binding.
+        conn.execute("UPDATE customers SET volume_serial = ? WHERE id = ?", (volume_serial(root), cid))
         # Rows from the old folder drop out of the index on the next run over the new one.
         _request_access(conn, request, p, cid, root)
         request.app.state.indexer.trigger()
     return {"ok": True}
+
+
+@router.post("/customers/{cid}/rebind-drive")
+def rebind_drive(cid: int, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                 conn: sqlite3.Connection = Depends(get_conn)):
+    """The customer's disk was replaced on purpose (e.g. copied to a bigger drive at the same
+    letter): accept the disk now at the customer's folder as theirs."""
+    row = conn.execute("SELECT slug, root_path, volume_serial FROM customers WHERE id = ?", (cid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No such customer.")
+    current = volume_serial(row["root_path"])
+    if not current:
+        raise HTTPException(409, "The drive is offline; connect it first.")
+    conn.execute("UPDATE customers SET volume_serial = ? WHERE id = ?", (current, cid))
+    audit.log(conn, "admin.customer.rebind_drive", user_id=p.user_id, username=p.username, customer_id=cid,
+              ip=client_ip(request), detail=f"{row['slug']} {row['root_path']}: {row['volume_serial']} -> {current}")
+    request.app.state.indexer.trigger()
+    return {"ok": True, "volume_serial": current}
 
 
 @router.get("/customers/{cid}/folders")

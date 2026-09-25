@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from . import audit
 from .config import Config
 from .deps import active_user, client_ip, get_cfg, get_conn
-from .indexer import root_online
+from .indexer import drive_state, root_online
 from .scope import Principal, effective_customer_id, scope_sql
 
 router = APIRouter(prefix="/api/recordings", tags=["recordings"])
@@ -160,9 +160,10 @@ def summary(
     cid = effective_customer_id(p, customer_id)
     drive = None
     if cid is not None:
-        c = conn.execute("SELECT root_path FROM customers WHERE id = ?", (cid,)).fetchone()
+        c = conn.execute("SELECT root_path, volume_serial FROM customers WHERE id = ?", (cid,)).fetchone()
         if c:
-            drive = {"root": c["root_path"], "online": root_online(c["root_path"])}
+            state = drive_state(c["root_path"], c["volume_serial"])
+            drive = {"root": c["root_path"], "online": state == "online", "state": state}
     last = None
     if cid is not None:
         lr = conn.execute(
@@ -182,15 +183,19 @@ def summary(
 def _resolve(conn: sqlite3.Connection, p: Principal, rec_id: int) -> tuple[sqlite3.Row, Path]:
     s_sql, s_params = scope_sql(conn, p, None if p.is_superadmin else p.customer_id)
     row = conn.execute(
-        f"SELECT r.*, c.root_path FROM recordings r JOIN customers c ON c.id = r.customer_id "
+        f"SELECT r.*, c.root_path, c.volume_serial FROM recordings r JOIN customers c ON c.id = r.customer_id "
         f"WHERE r.id = ? AND {s_sql}",
         [rec_id] + s_params,
     ).fetchone()
     if row is None:
         raise HTTPException(404, "Recording not found.")
     root = Path(row["root_path"]).resolve()
-    if not root_online(str(root)):
+    state = drive_state(str(root), row["volume_serial"])
+    if state == "offline":
         raise HTTPException(503, "The storage drive for this customer is currently offline.")
+    if state == "wrong_drive":
+        # another disk is at this drive letter: never serve it as this customer's recording
+        raise HTTPException(503, "The storage drive for this customer is not available. Please contact support.")
     full = (root / row["rel_path"]).resolve()
     # belt and braces: the resolved path must stay inside the customer root
     try:
@@ -287,14 +292,14 @@ def zip_download(
         s_sql, s_params = scope_sql(conn, p, None if p.is_superadmin else p.customer_id)
         q = ",".join("?" * len(body.ids))
         rows = conn.execute(
-            f"SELECT r.*, c.root_path FROM recordings r JOIN customers c ON c.id = r.customer_id "
+            f"SELECT r.*, c.root_path, c.volume_serial FROM recordings r JOIN customers c ON c.id = r.customer_id "
             f"WHERE r.id IN ({q}) AND {s_sql} ORDER BY r.rec_ts",
             body.ids + s_params,
         ).fetchall()
     elif body.filters:
         where, params = _where(conn, p, body.filters)
         rows = conn.execute(
-            f"SELECT r.*, c.root_path FROM recordings r JOIN customers c ON c.id = r.customer_id "
+            f"SELECT r.*, c.root_path, c.volume_serial FROM recordings r JOIN customers c ON c.id = r.customer_id "
             f"WHERE {where} ORDER BY r.rec_ts LIMIT ?",
             params + [cfg.zip_max_files + 1],
         ).fetchall()
@@ -310,9 +315,10 @@ def zip_download(
         raise HTTPException(413, f"Selection is {total/1e9:.1f} GB; the limit is {cfg.zip_max_bytes/1e9:.1f} GB.")
 
     roots = {r["customer_id"]: Path(r["root_path"]).resolve() for r in rows}
+    serials = {r["customer_id"]: r["volume_serial"] for r in rows}
     for cid, root in roots.items():
-        if not root_online(str(root)):
-            raise HTTPException(503, "A required storage drive is offline.")
+        if drive_state(str(root), serials[cid]) != "online":
+            raise HTTPException(503, "A required storage drive is not available.")
 
     tmp = tempfile.NamedTemporaryFile(prefix="tv-", suffix=".zip", dir=cfg.tmp_dir, delete=False)
     tmp_path = Path(tmp.name)

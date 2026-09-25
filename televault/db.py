@@ -168,6 +168,7 @@ MIGRATIONS = [
     ("sessions", "mfa_failures", "INTEGER NOT NULL DEFAULT 0"),
     ("sessions", "mfa_verified_at", "TEXT"),                      # last code entry (step-up window)
     ("departments", "folders_json", "TEXT NOT NULL DEFAULT '[]'"),  # folders under the customer root
+    ("customers", "volume_serial", "TEXT"),  # serial of the disk the root is on (guards against letter swaps)
 ]
 
 

@@ -254,7 +254,7 @@ async function viewRecordings(main) {
       const chips = [h("span", { class: "chip" }, h("b", {}, s.count.toLocaleString()), " files · ", fmtBytes(s.bytes))];
       if (s.first) chips.push(h("span", { class: "chip" }, fmtTs(s.first).slice(0, 10), " → ", fmtTs(s.last).slice(0, 10)));
       for (const t of s.by_type) chips.push(h("span", { class: "chip" }, h("span", { class: `badge ${t.type}` }, t.type), ` ${t.count.toLocaleString()}`, t.empty ? h("span", { class: "tag-empty" }, ` (${t.empty} empty)`) : ""));
-      if (s.drive) chips.push(h("span", { class: "chip" }, "Drive ", h("b", { class: s.drive.online ? "ok" : "error" }, s.drive.online ? "online" : "OFFLINE"), ` ${s.drive.root}`));
+      if (s.drive) chips.push(h("span", { class: "chip" }, "Drive ", h("b", { class: s.drive.online ? "ok" : "error" }, s.drive.online ? "online" : s.drive.state === "wrong_drive" ? "NOT AVAILABLE" : "OFFLINE"), ` ${s.drive.root}`));
       if (s.last_index) chips.push(h("span", { class: "chip muted" }, `indexed ${fmtTs(s.last_index.finished_at || s.last_index.started_at)} (${s.last_index.status})`));
       summaryEl.replaceChildren(...chips);
     } catch (e) { summaryEl.replaceChildren(h("span", { class: "error" }, e.message)); }
@@ -341,7 +341,7 @@ async function viewCustomers(main) {
       h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Name", "Slug", "Root path", "Drive", "Service access", "Files", "Last index", "Enabled", ""].map(t => h("th", {}, t)))),
         h("tbody", {}, ...list.map(c => h("tr", {},
           h("td", {}, c.name), h("td", { class: "mono" }, c.slug), h("td", { class: "mono" }, c.root_path),
-          h("td", {}, h("b", { class: c.online ? "ok" : "error" }, c.online ? "online" : "OFFLINE")),
+          h("td", {}, driveCell(c)),
           h("td", {}, accessCell(c)),
           h("td", {}, c.recordings.toLocaleString()),
           h("td", { class: "muted" }, c.last_index ? `${fmtTs(c.last_index.finished_at || c.last_index.started_at)} · ${c.last_index.status}${c.last_index.message ? " · " + c.last_index.message : ""}` : "never"),
@@ -354,6 +354,21 @@ async function viewCustomers(main) {
   clearTimeout(viewCustomers._t);
   if (list.some(c => ["pending", "running"].includes(c.access?.grant?.status)))
     viewCustomers._t = setTimeout(() => { if (state.view === "customers" && !document.querySelector("dialog[open]")) render(); }, 15000);
+}
+
+/* Drive state. "WRONG DISK" = another disk now sits at this customer's drive letter (letters
+   moved after a restart / new USB disk). Nothing is indexed or served until the right disk is
+   back - or, if the disk was replaced on purpose, a superadmin confirms "Use this disk". */
+function driveCell(c) {
+  if (c.drive_state === "wrong_drive") {
+    return h("div", {},
+      h("b", { class: "error", title: `Expected disk ${c.volume_serial}, found ${c.current_serial || "?"}` }, "WRONG DISK "),
+      h("button", { class: "btn small", type: "button", onclick: async () => {
+        if (!confirm(`The disk at ${c.root_path} is not the one registered for ${c.name} (expected ${c.volume_serial}, found ${c.current_serial}).\n\nOnly continue if this disk really is ${c.name}'s (e.g. copied to a new drive). Otherwise fix the drive letters instead.`)) return;
+        try { await api(`/api/admin/customers/${c.id}/rebind-drive`, { method: "POST" }); toast("Disk accepted; re-indexing."); render(); }
+        catch (x) { toast(x.message, true); } } }, "Use this disk"));
+  }
+  return h("b", { class: c.online ? "ok" : "error", title: c.volume_serial ? `Disk ${c.volume_serial}` : "" }, c.online ? "online" : "OFFLINE");
 }
 
 /* Service-account access to a customer folder, and the button that requests it. The web app

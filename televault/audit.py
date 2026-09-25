@@ -14,7 +14,7 @@ import sqlite3
 log_ = logging.getLogger("televault.audit")
 
 _eventlog_enabled = False
-_WARN_MARKERS = (".fail", "blocked", "locked", "ratelimited", "reset", "reused")
+_WARN_MARKERS = (".fail", "blocked", "locked", "ratelimited", "reset", "reused", "mismatch")
 
 EVENTLOG_SOURCE = "TeleVault"
 EVENT_INFO, EVENT_WARNING = 0x0004, 0x0002

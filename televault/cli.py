@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 
 from .config import APP_NAME, load_config
 from .db import Database
-from .indexer import index_all, index_customer, root_online
+from .indexer import drive_state, index_all, index_customer, root_online
 from .security import hash_password, password_policy_error
 
 
@@ -284,8 +284,10 @@ def cmd_list_customers(_args) -> int:
     db = Database(cfg.db_path)
     with db.conn() as c:
         for r in c.execute("SELECT c.*, (SELECT COUNT(*) FROM recordings r WHERE r.customer_id=c.id) n FROM customers c ORDER BY id"):
+            state = drive_state(r["root_path"], r["volume_serial"])
+            flag = {"online": "on ", "offline": "OFF", "wrong_drive": "WRONG DISK"}[state]
             print(f"#{r['id']:<3} {r['slug']:<16} {r['name']:<30} {r['root_path']:<20} "
-                  f"{'on ' if root_online(r['root_path']) else 'OFF'} {r['n']} files {'enabled' if r['enabled'] else 'disabled'}")
+                  f"{flag} disk {r['volume_serial'] or '-'} {r['n']} files {'enabled' if r['enabled'] else 'disabled'}")
     return 0
 
 
