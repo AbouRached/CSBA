@@ -98,3 +98,33 @@ def test_backup_command(env, tmp_path, monkeypatch):
     assert cli.main(["backup", str(tmp_path / "bk")]) == 0
     out = next((tmp_path / "bk").glob("televault-*"))
     assert (out / "televault.sqlite3").stat().st_size > 0 and (out / "mfa.key").exists()
+
+
+# ---------------------------------------------------------------- staff networks managed in the UI
+
+def test_staff_network_added_in_ui_lets_superadmin_in(env):
+    out = client_from(env["app"], OUTSIDE)
+    r = login_password_only(out, "root")
+    assert r.status_code == 403 and OUTSIDE[0] in r.json()["detail"]   # tells them which address to allow
+    admin = env["client"]; login(admin, "root")
+    for bad in ("0.0.0.0/0", "10.0.0.0/7", "not-an-ip", "::/0"):
+        assert admin.post("/api/admin/staff-networks", json={"cidr": bad}, headers=HDR).status_code == 400, bad
+    assert admin.post("/api/admin/staff-networks", json={"cidr": "10.50.0.0/16"}, headers=HDR).status_code == 409  # in config
+    r = admin.post("/api/admin/staff-networks", json={"cidr": OUTSIDE[0], "note": "branch"}, headers=HDR)
+    assert r.status_code == 200 and r.json()["cidr"] == f"{OUTSIDE[0]}/32"
+    assert admin.post("/api/admin/staff-networks", json={"cidr": OUTSIDE[0]}, headers=HDR).status_code == 409
+    listing = admin.get("/api/admin/staff-networks").json()
+    assert listing["config"] == ["10.50.0.0/16"] and listing["from_staff_network"] is True
+    assert [n["cidr"] for n in listing["managed"]] == [f"{OUTSIDE[0]}/32"]
+    assert login_password_only(client_from(env["app"], OUTSIDE), "root").status_code == 200
+    assert admin.delete(f"/api/admin/staff-networks/{r.json()['id']}", headers=HDR).status_code == 200
+    assert login_password_only(client_from(env["app"], OUTSIDE), "root").status_code == 403
+    with env["db"].conn() as conn:
+        acts = [a for (a,) in conn.execute("SELECT action FROM audit_log WHERE action LIKE 'admin.staff_network.%'")]
+    assert acts == ["admin.staff_network.add", "admin.staff_network.remove"]
+
+
+def test_only_superadmins_manage_staff_networks(env):
+    a = env["client"]; login(a, "alpha_admin")
+    assert a.get("/api/admin/staff-networks").status_code == 403
+    assert a.post("/api/admin/staff-networks", json={"cidr": "198.51.100.0/24"}, headers=HDR).status_code == 403

@@ -19,8 +19,8 @@ from pydantic import BaseModel, Field
 
 from . import audit, grants
 from .config import Config
-from .deps import (client_ip, get_cfg, get_conn, get_db, require_admin, require_admin_stepup, require_superadmin,
-                   require_superadmin_stepup)
+from .deps import (client_ip, from_staff_network, get_cfg, get_conn, get_db, normalize_network, require_admin,
+                   require_admin_stepup, require_superadmin, require_superadmin_stepup)
 from .indexer import drive_state, root_online, volume_serial
 from .access import normalize_pattern
 from .mfa import reset_user_mfa
@@ -683,6 +683,51 @@ def remove_staff_access(sid: int, request: Request, p: Principal = Depends(requi
     conn.execute("DELETE FROM staff_access WHERE id = ?", (sid,))
     audit.log(conn, "admin.staff_access.remove", user_id=p.user_id, username=p.username, ip=client_ip(request),
               detail=row["pattern"])
+    return {"ok": True}
+
+
+# ---------------------------------------------------------------- staff networks (office / VPN)
+
+class StaffNetworkIn(BaseModel):
+    cidr: str = Field(min_length=2, max_length=64)   # 203.0.113.7  or  203.0.113.0/24
+    note: str = Field(default="", max_length=200)
+
+
+@router.get("/staff-networks")
+def list_staff_networks(request: Request, p: Principal = Depends(require_superadmin),
+                        conn: sqlite3.Connection = Depends(get_conn), cfg: Config = Depends(get_cfg)):
+    return {"your_ip": client_ip(request), "from_staff_network": from_staff_network(request),
+            "config": list(cfg.staff_networks),
+            "managed": [dict(r) for r in conn.execute("SELECT * FROM staff_networks ORDER BY cidr")]}
+
+
+@router.post("/staff-networks")
+def add_staff_network(body: StaffNetworkIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                      conn: sqlite3.Connection = Depends(get_conn), cfg: Config = Depends(get_cfg)):
+    cidr = normalize_network(body.cidr)
+    if cidr is None:
+        raise HTTPException(400, "Enter an IP address or a network such as 203.0.113.0/24 (no wider than /8).")
+    if cidr in cfg.staff_networks:
+        raise HTTPException(409, "Already allowed in config.json.")
+    try:
+        cur = conn.execute("INSERT INTO staff_networks(cidr, note, created_by) VALUES (?,?,?)",
+                           (cidr, body.note.strip(), p.username))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Already on the list.")
+    audit.log(conn, "admin.staff_network.add", user_id=p.user_id, username=p.username, ip=client_ip(request),
+              detail=f"{cidr} {body.note.strip()}".strip())
+    return {"id": cur.lastrowid, "cidr": cidr}
+
+
+@router.delete("/staff-networks/{nid}")
+def remove_staff_network(nid: int, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                         conn: sqlite3.Connection = Depends(get_conn)):
+    row = conn.execute("SELECT cidr FROM staff_networks WHERE id = ?", (nid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No such entry.")
+    conn.execute("DELETE FROM staff_networks WHERE id = ?", (nid,))
+    audit.log(conn, "admin.staff_network.remove", user_id=p.user_id, username=p.username, ip=client_ip(request),
+              detail=row["cidr"])
     return {"ok": True}
 
 

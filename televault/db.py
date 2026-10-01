@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS staff_access (
     created_by  TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
+
+-- Extra staff networks (CIDR) managed in the admin UI, on top of config.json's staff_networks.
+CREATE TABLE IF NOT EXISTS staff_networks (
+    id          INTEGER PRIMARY KEY,
+    cidr        TEXT NOT NULL UNIQUE,
+    note        TEXT NOT NULL DEFAULT '',
+    created_by  TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
 """
 
 

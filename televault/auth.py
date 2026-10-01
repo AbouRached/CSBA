@@ -8,7 +8,7 @@ from pydantic import BaseModel, Field
 
 from . import audit
 from .config import Config
-from .deps import STAFF_ONLY, client_ip, current_user, from_staff_network, get_cfg, get_conn, session_user
+from .deps import client_ip, current_user, from_staff_network, get_cfg, get_conn, session_user, staff_only_message
 from .scope import Principal, load_memberships
 from .security import (
     SESSION_COOKIE,
@@ -112,7 +112,7 @@ def login(
     if row["role"] == "superadmin" and not from_staff_network(request):
         # Correct password from outside the staff networks: refuse, and leave a trail (ADR-0001).
         audit.log(conn, "login.staff_blocked", ip=ip, username=row["username"], user_id=row["id"])
-        raise HTTPException(status_code=403, detail=STAFF_ONLY)
+        raise HTTPException(status_code=403, detail=staff_only_message(request))
 
     register_success(conn, row["id"])
     purge_expired_sessions(conn)

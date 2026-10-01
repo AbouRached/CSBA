@@ -62,9 +62,15 @@ if (-not (Test-Path "$Target\config.json")) {
             $prod | Add-Member -NotePropertyName $p.Name -NotePropertyValue $p.Value; $added += $p.Name
         }
     }
-    if ($added) {
+    # Staff networks are additive: networks listed in the dev config are added, none removed.
+    $nets = @($devc.staff_networks | Where-Object { $_ -and (@($prod.staff_networks) -notcontains $_) })
+    if ($nets -and -not ($added -contains "staff_networks")) {
+        $prod.staff_networks = @(@($prod.staff_networks) + $nets)
+        Write-Host "config.json: added staff networks $($nets -join ', ')"
+    }
+    if ($added -or $nets) {
         [IO.File]::WriteAllText("$Target\config.json", ($prod | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
-        Write-Host "config.json: added new settings $($added -join ', ') (existing values untouched)"
+        if ($added) { Write-Host "config.json: added new settings $($added -join ', ') (existing values untouched)" }
     }
 }
 Write-Host "Code copied to $Target"

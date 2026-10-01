@@ -73,6 +73,32 @@ def session_user(
     return p
 
 
+def staff_networks(request: Request) -> list[str]:
+    """config.json's staff_networks plus the ones added in the admin UI."""
+    cfg: Config = request.app.state.cfg
+    conn = connect(request.app.state.db.db_path)
+    try:
+        return list(cfg.staff_networks) + [r[0] for r in conn.execute("SELECT cidr FROM staff_networks")]
+    finally:
+        conn.close()
+
+
+def normalize_network(raw: str) -> str | None:
+    """A single address or CIDR block; refuses anything wider than /8 (IPv4) or /32 (IPv6),
+    which would quietly switch the office gate off."""
+    try:
+        net = ipaddress.ip_network(raw.strip(), strict=False)
+    except ValueError:
+        return None
+    if net.prefixlen < (8 if net.version == 4 else 32):
+        return None
+    return str(net)
+
+
+def staff_only_message(request: Request) -> str:
+    return f"{STAFF_ONLY} (TeleVault sees you as {client_ip(request) or 'unknown'}.)"
+
+
 def from_staff_network(request: Request) -> bool:
     """True for the staff office/VPN networks in config, or the local console on this PC.
     A request that came through the tunnel is never 'local', whatever its peer address."""
@@ -85,7 +111,7 @@ def from_staff_network(request: Request) -> bool:
         addr = ipaddress.ip_address(client_ip(request))
     except ValueError:
         addr = None
-    if addr is not None and any(addr in ipaddress.ip_network(n, strict=False) for n in cfg.staff_networks):
+    if addr is not None and any(addr in ipaddress.ip_network(n, strict=False) for n in staff_networks(request)):
         return True
     # Away from the office: a verified Cloudflare Access (Entra SSO) staff identity.
     from .access import staff_identity
@@ -101,7 +127,7 @@ def current_user(request: Request, p: Principal = Depends(session_user)) -> Prin
     if not p.mfa_ok:
         raise HTTPException(status_code=403, detail="Authenticator code required.")
     if p.is_superadmin and not from_staff_network(request):
-        raise HTTPException(status_code=403, detail=STAFF_ONLY)
+        raise HTTPException(status_code=403, detail=staff_only_message(request))
     return p
 
 

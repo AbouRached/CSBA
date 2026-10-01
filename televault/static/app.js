@@ -541,7 +541,34 @@ async function viewDevAccess(main) {
 
 /* ------------------------------------------------------------------ admin: staff access */
 async function viewStaffAccess(main) {
-  const list = await api("/api/admin/staff-access");
+  const [list, nets] = await Promise.all([api("/api/admin/staff-access"), api("/api/admin/staff-networks")]);
+  const netForm = h("form", { class: "row" },
+    h("label", { class: "grow" }, "IP address or network", h("input", { name: "cidr", required: "", placeholder: "203.0.113.7  or  203.0.113.0/24", class: "mono" })),
+    h("label", { class: "grow" }, "Note", h("input", { name: "note", placeholder: "site / VPN / link" })),
+    h("button", { class: "btn primary", type: "submit" }, "Allow network"));
+  netForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("/api/admin/staff-networks", { method: "POST", body: { cidr: netForm.cidr.value, note: netForm.note.value } });
+      toast(`${r.cidr} is now a staff network.`); render();
+    } catch (x) { toast(x.message, true); }
+  });
+  const netRows = [
+    ...nets.config.map(c => ({ cidr: c, note: "", created_by: "config.json", created_at: "", fixed: true })),
+    ...nets.managed];
+  const netCard = h("div", { class: "card" }, h("h2", {}, "Staff networks · office & VPN"),
+    h("p", { class: "muted" }, "Superadmin accounts work from these networks without the staff-email check. Visitors arrive through Cloudflare, so TeleVault sees each one's ",
+      h("b", {}, "public internet address"), " — internal 10.x / 172.16-31.x / 192.168.x ranges only match on this PC itself. Add each site's public (egress) address."),
+    h("p", {}, "You are seen as ", h("code", {}, nets.your_ip || "unknown"), " — ",
+      nets.from_staff_network ? h("span", { class: "ok" }, "allowed") : h("span", { class: "warn-inline" }, "not on a staff network (allowed by staff email)")),
+    h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Network", "Note", "Added by", "Added", ""].map(t => h("th", {}, t)))),
+      h("tbody", {}, ...netRows.map(n => h("tr", {},
+        h("td", { class: "mono" }, n.cidr), h("td", {}, n.note), h("td", { class: "muted" }, n.created_by), h("td", { class: "muted" }, fmtTs(n.created_at)),
+        h("td", { class: "actions" }, n.fixed ? h("span", { class: "muted", title: "Edit config.json on the server to change" }, "fixed") :
+          h("button", { class: "btn small danger", type: "button", onclick: async () => {
+            if (!confirm(`Remove ${n.cidr}? Superadmins there will need the staff-email check.`)) return;
+            try { await api(`/api/admin/staff-networks/${n.id}`, { method: "DELETE" }); toast("Removed."); render(); } catch (x) { toast(x.message, true); } } }, "Remove"))))))),
+    h("h2", { style: "margin-top:16px" }, "Allow a network"), netForm);
   const form = h("form", { class: "row" },
     h("label", { class: "grow" }, "Email or domain", h("input", { name: "pattern", required: "", placeholder: "name@anydomain.com  or  @anydomain.com", class: "mono" })),
     h("label", { class: "grow" }, "Note", h("input", { name: "note", placeholder: "who / why" })),
@@ -553,7 +580,7 @@ async function viewStaffAccess(main) {
       toast(`${r.pattern} can now verify as staff.`); render();
     } catch (x) { toast(x.message, true); }
   });
-  main.replaceChildren(
+  main.replaceChildren(netCard,
     h("div", { class: "card" }, h("h2", {}, "Staff access · away from the office"),
       h("p", { class: "muted" }, "Superadmin accounts work from the office network. Anywhere else, the person first proves they own an email address on this list (",
         h("i", {}, "verify your staff email"), " on the sign-in page), then signs in with password and authenticator as usual. Any domain works; a domain entry (@example.com) allows every address in it."),

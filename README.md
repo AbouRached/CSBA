@@ -69,7 +69,7 @@ See [SECURITY.md](SECURITY.md) for the security model.
 |---|---|---|
 | `host` / `port` | 127.0.0.1 / 8443 | HTTPS listener (keep loopback behind a tunnel) |
 | `vendor_name` | "" | Operator name shown in authenticator apps, MCP title, TLS certificate |
-| `staff_networks` | [] | CIDRs where superadmin accounts may be used (the local console always may) |
+| `staff_networks` | [] | CIDRs where superadmin accounts may be used (the local console always may); more can be added in the admin UI |
 | `trust_cloudflare_header` | false | Use `CF-Connecting-IP` (only from loopback) as the client IP |
 | `session_ttl_hours` / `session_max_hours` / `superadmin_session_max_hours` | 12 / 168 / 8 | Idle timeout and absolute caps |
 | `step_up_minutes` | 10 | Freshness of the code required for sensitive admin actions |
