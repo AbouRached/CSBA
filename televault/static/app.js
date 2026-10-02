@@ -556,7 +556,7 @@ async function viewSftp(main, shown = null) {
       h("label", {}, "Customer", h("select", { name: "customer_id" }, ...customers.map(c => h("option", { value: c.id, selected: a?.customer_id === c.id ? "" : null }, c.name)))),
       h("label", {}, "Days of recordings", h("input", { name: "window_days", type: "number", min: "1", max: "366", value: a?.window_days || 30 })),
       h("label", {}, "Active", h("select", { name: "active" }, h("option", { value: "1" }, "yes"), h("option", { value: "0", selected: a && !a.active ? "" : null }, "no"))),
-      h("label", { class: "grow" }, "Vendor's IP addresses (one per line)", h("textarea", { name: "allowed_ips", rows: "3", class: "mono", required: "", placeholder: "203.0.113.7\n198.51.100.0/28" }, (a?.allowed_ips || []).join("\n"))),
+      h("label", { class: "grow" }, "Vendor's IP addresses (one per line; tunnel mode: enforced in Cloudflare Access)", h("textarea", { name: "allowed_ips", rows: "3", class: "mono", placeholder: "203.0.113.7\n198.51.100.0/28" }, (a?.allowed_ips || []).join("\n"))),
       h("label", { class: "grow" }, "Vendor's SSH public key(s) — preferred", h("textarea", { name: "public_keys", rows: "3", class: "mono", placeholder: "ssh-ed25519 AAAA... vendor" }, a?.public_keys || "")),
       h("label", {}, a?.has_password ? "Password" : "Password (if they can't use a key)", h("select", { name: "pw" },
         h("option", { value: "keep" }, a?.has_password ? "keep current" : "none"),
@@ -581,16 +581,27 @@ async function viewSftp(main, shown = null) {
   fill();
   if (shown) showPw(...shown);
   const sv = r.server;
+  const tunnel = sv.mode === "tunnel";
+  const host = sv.public_host || "<public address - set it above>";
   const vendorText = (a) => [
     `SFTP access to ${a.customer_name} call recordings (read-only)`,
-    `Host: ${sv.public_host || "<public address - set it above>"}`,
-    `Port: ${sv.port}`,
+    ...(tunnel ? [
+      `Host: ${host} (through Cloudflare - install cloudflared: https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/)`,
+      `Cloudflare service token: Client ID and Client Secret, sent to you separately`,
+      `Connect with OpenSSH (~/.ssh/config):`,
+      `  Host ${host}`,
+      `    User ${a.username}`,
+      `    ProxyCommand cloudflared access ssh --hostname %h --service-token-id <CLIENT_ID> --service-token-secret <CLIENT_SECRET>`,
+      `  then: sftp ${host}`,
+      `Or for SFTP libraries: cloudflared access tcp --hostname ${host} --url 127.0.0.1:2222 --service-token-id <CLIENT_ID> --service-token-secret <CLIENT_SECRET>`,
+      `  and connect your SFTP client to 127.0.0.1 port 2222`,
+    ] : [`Host: ${host}`, `Port: ${sv.port}`]),
     `Username: ${a.username}`,
     `Sign-in: ${a.key_fingerprints.length ? "your SSH key (the public key you sent us)" : ""}${a.key_fingerprints.length && a.has_password ? " or " : ""}${a.has_password ? "the password we send you separately" : ""}`,
     `Server host key (verify on first connect): ${r.host_fingerprint}`,
     `Content: folders YYYY/MM/DD with the latest ${a.window_days} days of recordings; older files disappear automatically.`,
-    `Connections are accepted only from: ${a.allowed_ips.join(", ")}`,
-  ].join("\n");
+    a.allowed_ips.length ? `Connections are accepted only from: ${a.allowed_ips.join(", ")}` : null,
+  ].filter(x => x !== null).join("\n");
   const details = h("div", { hidden: "" });
   const showDetails = (a) => {
     const text = vendorText(a);
@@ -617,15 +628,18 @@ async function viewSftp(main, shown = null) {
   // server: on/off, port, public address + live status of listener, firewall and router step
   const srvForm = h("form", { class: "row" },
     h("label", {}, "SFTP server", h("select", { name: "enabled" }, h("option", { value: "1", selected: sv.enabled ? "" : null }, "on"), h("option", { value: "0", selected: sv.enabled ? null : "" }, "off"))),
+    h("label", {}, "Reached through", h("select", { name: "mode" },
+      h("option", { value: "tunnel", selected: tunnel ? "" : null }, "Cloudflare tunnel (no open port)"),
+      h("option", { value: "direct", selected: tunnel ? null : "" }, "Router port-forward"))),
     h("label", {}, "Port", h("input", { name: "port", type: "number", min: "1024", max: "65535", value: sv.port })),
-    h("label", { class: "grow" }, "Public address the vendor connects to", h("input", { name: "public_host", value: sv.public_host, placeholder: "sftp.example.com or 203.0.113.10", class: "mono" })),
+    h("label", { class: "grow" }, tunnel ? "Cloudflare hostname" : "Public address the vendor connects to", h("input", { name: "public_host", value: sv.public_host, placeholder: "sftp.example.com", class: "mono" })),
     h("button", { class: "btn primary", type: "submit" }, "Save"));
   srvForm.onsubmit = async (e) => {
     e.preventDefault();
     const on = srvForm.enabled.value === "1";
     if (!on && sv.enabled && !confirm("Switch the SFTP server off? Every vendor is disconnected and the firewall closes within a minute.")) return;
     try {
-      await api("/api/admin/sftp/server", { method: "PUT", body: { enabled: on, port: Number(srvForm.port.value), public_host: srvForm.public_host.value.trim() } });
+      await api("/api/admin/sftp/server", { method: "PUT", body: { enabled: on, mode: srvForm.mode.value, port: Number(srvForm.port.value), public_host: srvForm.public_host.value.trim() } });
       toast(on ? "Saved - the server and firewall follow within a minute." : "Switched off."); render();
     } catch (x) { toast(x.message, true); }
   };
@@ -634,10 +648,12 @@ async function viewSftp(main, shown = null) {
   const statusLine = (label, good, text) => h("li", {}, h("b", {}, label + ": "), good === null ? h("span", { class: "muted" }, text) : h("span", { class: good ? "ok" : "warn-inline" }, text));
   const status = h("ul", { class: "status-list" },
     statusLine("Server", sv.enabled ? sv.listening : null,
-      !sv.enabled ? "off" : sv.listening ? `listening on port ${sv.port}` : (sv.listen_error ? `not listening - ${sv.listen_error}` : "starting (refresh in a few seconds)")),
-    statusLine("Windows firewall", fwAge > 3 ? false : fw.state === "open" ? true : fw.state === "error" ? false : null,
+      !sv.enabled ? "off" : sv.listening ? (tunnel ? `listening on 127.0.0.1:${sv.port} - only the Cloudflare tunnel can reach it` : `listening on port ${sv.port}`)
+        : (sv.listen_error ? `not listening - ${sv.listen_error}` : "starting (refresh in a few seconds)")),
+    tunnel ? statusLine("Cloudflare", null, `${sv.public_host || "(set the hostname)"} → tunnel → ssh://localhost:${sv.port}; only clients with the vendor's Cloudflare Access service token get through (and only from the addresses in that Access policy)`) : null,
+    tunnel ? null : statusLine("Windows firewall", fwAge > 3 ? false : fw.state === "open" ? true : fw.state === "error" ? false : null,
       fwAge > 3 ? "no report from the TeleVault Grant Worker task in the last minutes - is it installed and running?" : `${fw.message} (checked ${fmtTs(fw.at)})`),
-    statusLine("Internet router (you set this once)", null, sv.enabled && sv.allowed_ips.length
+    tunnel ? null : statusLine("Internet router (you set this once)", null, sv.enabled && sv.allowed_ips.length
       ? `forward public TCP ${sv.port}${sv.public_host ? ` on ${sv.public_host}` : ""} → ${sv.lan_ip || "this PC"}:${sv.port}, allowed only from ${sv.allowed_ips.join(", ")}`
       : "nothing to forward yet"),
     h("li", {}, h("b", {}, "Host key: "), h("code", {}, r.host_fingerprint), h("span", { class: "muted" }, " - vendors verify this on first connect")));

@@ -59,6 +59,8 @@ DEFAULTS = {
     # set on the SFTP feeds page; the SYSTEM grant worker keeps the firewall rule in step.
     "sftp_port": 0,
     "sftp_host": "0.0.0.0",
+    # Hostname the vendor connects to (tunnel mode: the Cloudflare hostname routed to ssh://localhost:<port>).
+    "sftp_public_host": "",
     # Operator name shown in the authenticator app, MCP server title and TLS certificate.
     "vendor_name": "",
 }
@@ -97,6 +99,7 @@ class Config:
     mcp_port: int = 8765
     sftp_port: int = 0
     sftp_host: str = "0.0.0.0"
+    sftp_public_host: str = ""
     vendor_name: str = ""
 
     @property
@@ -156,6 +159,7 @@ def load_config() -> Config:
         mcp_port=int(raw["mcp_port"]),
         sftp_port=int(raw["sftp_port"]),
         sftp_host=str(raw["sftp_host"]).strip(),
+        sftp_public_host=str(raw["sftp_public_host"]).strip().lower(),
         vendor_name=str(raw["vendor_name"]).strip(),
     )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)

@@ -738,7 +738,8 @@ def list_sftp(p: Principal = Depends(require_superadmin), conn: sqlite3.Connecti
     rows = conn.execute("SELECT a.*, c.name AS customer_name FROM sftp_accounts a "
                         "JOIN customers c ON c.id = a.customer_id ORDER BY a.username").fetchall()
     server = server_settings(conn, cfg)
-    server.update(listening=STATUS["listening"] and STATUS["port"] == server["port"], listen_error=STATUS["error"],
+    server.update(listening=STATUS["listening"] and STATUS["port"] == server["port"]
+                  and STATUS.get("host") == server["listen_host"], listen_error=STATUS["error"],
                   lan_ip=_lan_ip(), allowed_ips=firewall_plan(conn, cfg)["ips"])
     return {"server": server, "host_fingerprint": host_fingerprint(cfg),
             "accounts": [_sftp_window(conn, r) for r in rows]}
@@ -757,6 +758,7 @@ def _lan_ip() -> str:
 
 class SftpServerIn(BaseModel):
     enabled: bool
+    mode: str = Field(default="tunnel", pattern="^(tunnel|direct)$")
     port: int = Field(ge=1024, le=65535)
     public_host: str = Field(default="", max_length=253)
 
@@ -777,12 +779,13 @@ def update_sftp_server(body: SftpServerIn, request: Request, p: Principal = Depe
         except ValueError:
             if not _HOST_RE.match(host):
                 raise HTTPException(400, "Public address: a hostname (sftp.example.com) or an IP address.")
-    for k, v in (("sftp_enabled", "1" if body.enabled else "0"), ("sftp_port", str(body.port)), ("sftp_public_host", host)):
+    for k, v in (("sftp_enabled", "1" if body.enabled else "0"), ("sftp_mode", body.mode), ("sftp_port", str(body.port)),
+                 ("sftp_public_host", host)):
         conn.execute("INSERT INTO settings(key, value, updated_by) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET "
                      "value = excluded.value, updated_by = excluded.updated_by, "
                      "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')", (k, v, p.username))
     audit.log(conn, "admin.sftp.server", user_id=p.user_id, username=p.username, ip=client_ip(request),
-              detail=f"enabled={int(body.enabled)} port={body.port} public_host={host or '-'}")
+              detail=f"enabled={int(body.enabled)} mode={body.mode} port={body.port} public_host={host or '-'}")
     return {"ok": True}
 
 

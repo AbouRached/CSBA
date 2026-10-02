@@ -32,7 +32,14 @@ def _setup(env, ips=("127.0.0.1",), active=True, days=30):
                   "password_hash, active) VALUES (1, 'ai-feed', 1, ?, ?, ?, ?, ?)",
                   (days, json.dumps(list(ips)), CLIENT_KEY.export_public_key().decode(), hash_password(PASSWORD),
                    int(active)))
+    _mode(env, "direct")
     env["cfg"].sftp_host, env["cfg"].sftp_port = "127.0.0.1", 0
+
+
+def _mode(env, mode):
+    with env["db"].conn() as c:
+        c.execute("INSERT INTO settings(key, value) VALUES ('sftp_mode', ?) "
+                  "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (mode,))
 
 
 def _run(env, body):
@@ -151,8 +158,6 @@ def test_admin_api_superadmin_only_and_validated(env):
     assert c.post("/api/admin/sftp", json={**base, "generate_password": True, "allowed_ips": ["0.0.0.0/0"]},
                   headers=HDR).status_code == 400
     assert c.post("/api/admin/sftp", json={**base, "public_keys": "ssh-ed25519 garbage"}, headers=HDR).status_code == 400
-    assert c.post("/api/admin/sftp", json={**base, "generate_password": True, "allowed_ips": []},
-                  headers=HDR).status_code == 400
     key = CLIENT_KEY.export_public_key().decode()
     r = c.post("/api/admin/sftp", json={**base, "public_keys": key, "generate_password": True}, headers=HDR)
     assert r.status_code == 200 and len(r.json()["password"]) >= 20
@@ -179,6 +184,7 @@ def test_window_counts_back_from_the_newest_recording_not_today(env):
                   (datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),))
         c.execute("UPDATE recordings SET rec_ts = '2099-01-01T00:00:00' WHERE rel_path = ?", (RECENT2,))
         start, latest = tvsftp.window(c, 1, 1)
+    _mode(env, "direct")
     assert latest == "2026-08-20T11:52:55" and start == "2026-08-19T11:52:55"
     env["cfg"].sftp_host, env["cfg"].sftp_port = "127.0.0.1", 0
 
@@ -207,7 +213,8 @@ def test_server_settings_api_and_firewall_plan(env, capsys, monkeypatch):
     assert c.put("/api/admin/sftp/server", json={"enabled": True, "port": 22}, headers=HDR).status_code == 422
     assert c.put("/api/admin/sftp/server", json={"enabled": True, "port": 2222, "public_host": "bad host!"},
                  headers=HDR).status_code == 400
-    r = c.put("/api/admin/sftp/server", json={"enabled": True, "port": 2222, "public_host": "SFTP.Example.com"}, headers=HDR)
+    r = c.put("/api/admin/sftp/server", json={"enabled": True, "mode": "direct", "port": 2222,
+                                              "public_host": "SFTP.Example.com"}, headers=HDR)
     assert r.status_code == 200
     key = CLIENT_KEY.export_public_key().decode()
     c.post("/api/admin/sftp", json={"username": "ai-feed", "customer_id": 1, "allowed_ips": ["198.51.100.7", "203.0.113.0/24"],
@@ -266,3 +273,30 @@ def test_supervisor_follows_switch_and_kicks_disabled_accounts(env):
         finally:
             task.cancel()
     asyncio.run(main())
+
+
+# ---------------------------------------------------------------- Cloudflare tunnel mode
+
+def test_tunnel_mode_loopback_only_no_firewall_and_no_address_list(env, capsys, monkeypatch):
+    """Tunnel mode: listener on 127.0.0.1, reached only through the local cloudflared (Cloudflare
+    Access service token enforced there); no firewall rule; accounts need no address list."""
+    _setup(env, ips=())
+    _mode(env, "tunnel")
+    with env["db"].conn() as c:
+        c.execute("INSERT INTO settings(key, value) VALUES ('sftp_enabled', '1')")
+        s = tvsftp.server_settings(c, env["cfg"])
+        assert s["mode"] == "tunnel" and s["listen_host"] == "127.0.0.1"
+        assert tvsftp.firewall_plan(c, env["cfg"])["enabled"] is False
+
+    async def body(port):
+        async with _connect(port) as conn, conn.start_sftp_client() as sf:
+            return await sf.listdir("/")
+    assert "2026" in _run(env, body)
+    assert ("sftp.login", "sftp:ai-feed", 1, "via Cloudflare tunnel") in _audit(env, "sftp.login")
+    _mode(env, "direct")          # same account, direct mode, no addresses: refused
+
+    async def refused(port):
+        with pytest.raises((OSError, asyncssh.Error)):
+            async with _connect(port):
+                pass
+    _run(env, refused)

@@ -80,7 +80,9 @@ def key_fingerprints(text: str) -> list[str]:
 
 
 def parse_networks(items: list[str]) -> list[str]:
-    """Allowed source addresses; at least one, none wider than /16 (IPv4) or /48 (IPv6)."""
+    """Allowed source addresses, none wider than /16 (IPv4) or /48 (IPv6). May be empty: in tunnel
+    mode Cloudflare Access enforces the vendor's addresses; in direct mode an account without
+    addresses simply cannot connect."""
     out = []
     for raw in items:
         raw = raw.strip()
@@ -93,8 +95,6 @@ def parse_networks(items: list[str]) -> list[str]:
         if net.prefixlen < (16 if net.version == 4 else 48):
             raise ValueError(f"{raw} is too wide - list the vendor's own addresses.")
         out.append(str(net))
-    if not out:
-        raise ValueError("List at least one address the vendor connects from.")
     return sorted(set(out))
 
 
@@ -206,7 +206,10 @@ class Feed:
             if not a:
                 continue
             now = self.account(a["username"])
-            if not now or now["id"] != a["id"] or now["customer_id"] != a["customer_id"]                     or not _in(ip, json.loads(now["allowed_ips_json"] or "[]")):
+            tunnel = conn.get_extra_info("tv_tunnel")
+            if not now or now["id"] != a["id"] or now["customer_id"] != a["customer_id"] \
+                    or tunnel != self.tunnel_mode() \
+                    or (not tunnel and not _in(ip, json.loads(now["allowed_ips_json"] or "[]"))):
                 log.info("sftp: closing session of %s (account changed)", a["username"])
                 conn.abort()
 
@@ -225,6 +228,10 @@ class Feed:
 
     def fail(self, ip: str) -> None:
         self._fails.setdefault(ip, deque()).append(time.time())
+
+    def tunnel_mode(self) -> bool:
+        with self.db.conn() as c:
+            return server_settings(c, self.cfg)["mode"] == "tunnel"
 
     def known_address(self, ip: str) -> bool:
         with self.db.conn() as c:
@@ -304,7 +311,10 @@ class _SSHServer(asyncssh.SSHServer):
         self.feed.conns.add(conn)
         peer = conn.get_extra_info("peername")
         self.ip = str(peer[0]) if peer else ""
-        if self.feed.blocked(self.ip) or not self.feed.known_address(self.ip):
+        # Tunnel mode: the listener is loopback-only and the peer is the local cloudflared, which
+        # admits only clients holding the vendor's Cloudflare Access service token (ADR-0001 #18).
+        self.tunnel = self.feed.tunnel_mode() and self.ip in ("127.0.0.1", "::1")
+        if self.feed.blocked(self.ip) or not (self.tunnel or self.feed.known_address(self.ip)):
             log.info("sftp: dropped connection from %s", self.ip)
             conn.abort()
 
@@ -313,7 +323,7 @@ class _SSHServer(asyncssh.SSHServer):
 
     def begin_auth(self, username: str) -> bool:
         acct = self.feed.account(username)
-        if acct and _in(self.ip, json.loads(acct["allowed_ips_json"] or "[]")):
+        if acct and (self.tunnel or _in(self.ip, json.loads(acct["allowed_ips_json"] or "[]"))):
             self.acct = acct
         else:
             self.acct = None
@@ -348,8 +358,8 @@ class _SSHServer(asyncssh.SSHServer):
     def auth_completed(self) -> None:
         a = self.acct
         assert a is not None and self.conn is not None
-        self.conn.set_extra_info(tv_account=a, tv_ip=self.ip)
-        self.feed.audit("sftp.login", a, a["username"], self.ip)
+        self.conn.set_extra_info(tv_account=a, tv_ip=self.ip, tv_tunnel=self.tunnel)
+        self.feed.audit("sftp.login", a, a["username"], self.ip, "via Cloudflare tunnel" if self.tunnel else "")
 
 
 class _ReadOnlySFTP(asyncssh.SFTPServer):
@@ -451,40 +461,48 @@ RESERVED_PORTS = {8443, 8765}
 def server_settings(conn, cfg: Config) -> dict:
     """What the SFTP feeds page saved; config.json only provides the first defaults."""
     kv = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM settings WHERE key LIKE 'sftp_%'")}
+    mode = kv.get("sftp_mode", "tunnel")
+    mode = mode if mode in ("tunnel", "direct") else "tunnel"
     return {
         "enabled": kv.get("sftp_enabled", "1" if cfg.sftp_port else "0") == "1",
+        "mode": mode,
+        # tunnel: only the local cloudflared can reach it; direct: router forward + firewall rule
+        "listen_host": "127.0.0.1" if mode == "tunnel" else cfg.sftp_host,
         "port": int(kv.get("sftp_port", cfg.sftp_port or 2222)),
-        "public_host": kv.get("sftp_public_host", ""),
+        "public_host": kv.get("sftp_public_host", cfg.sftp_public_host),
         "firewall": {"state": kv.get("sftp_fw_state", "unknown"), "message": kv.get("sftp_fw_message", ""),
                      "at": kv.get("sftp_fw_at")},
     }
 
 
 def firewall_plan(conn, cfg: Config) -> dict:
-    """What the SYSTEM worker should open: the port, only from active feeds' addresses."""
+    """What the SYSTEM worker should open: the port, only from active feeds' addresses, and only
+    in direct mode (tunnel mode never opens a port)."""
     s = server_settings(conn, cfg)
     ips: set[str] = set()
     for (j,) in conn.execute("SELECT allowed_ips_json FROM sftp_accounts WHERE active = 1"):
         ips.update(json.loads(j or "[]"))
-    return {"enabled": s["enabled"], "port": s["port"], "ips": sorted(ips)}
+    return {"enabled": s["enabled"] and s["mode"] == "direct", "port": s["port"], "ips": sorted(ips)}
 
 
 STATUS: dict = {"listening": False, "port": None, "error": ""}
 
 
-async def start(cfg: Config, db: Database, port: int | None = None, feed: Feed | None = None):
+async def start(cfg: Config, db: Database, port: int | None = None, feed: Feed | None = None,
+                host: str | None = None):
     """Start the SFTP listener (supervise() does this from the saved settings; tests call it)."""
     feed = feed or Feed(cfg, db)
     port = cfg.sftp_port if port is None else port
+    host = cfg.sftp_host if host is None else host
     server = await asyncssh.listen(
-        cfg.sftp_host, port,
+        host, port,
         server_factory=lambda: _SSHServer(feed),
         server_host_keys=[host_key(cfg)],
         sftp_factory=lambda chan: _ReadOnlySFTP(chan, feed),
         allow_scp=False, agent_forwarding=False, x11_forwarding=False,
         login_timeout=30, keepalive_interval=60,
     )
-    log.info("SFTP feed on %s:%d (host key %s)", cfg.sftp_host, port, host_fingerprint(cfg))
+    log.info("SFTP feed on %s:%d (host key %s)", host, port, host_fingerprint(cfg))
     return server
 
 
@@ -497,16 +515,16 @@ async def supervise(cfg: Config, db: Database, interval: float = 5.0) -> None:
         try:
             with db.conn() as c:
                 want = server_settings(c, cfg)
-            if server and (not want["enabled"] or want["port"] != port):
+            if server and (not want["enabled"] or (want["listen_host"], want["port"]) != port):
                 server.close()
                 feed.close_all()
                 server, port = None, None
                 STATUS.update(listening=False, port=None, error="")
             if want["enabled"] and server is None:
                 try:
-                    server = await start(cfg, db, want["port"], feed)
-                    port = want["port"]
-                    STATUS.update(listening=True, port=port, error="")
+                    server = await start(cfg, db, want["port"], feed, want["listen_host"])
+                    port = (want["listen_host"], want["port"])
+                    STATUS.update(listening=True, port=want["port"], host=want["listen_host"], error="")
                 except OSError as e:
                     if STATUS["error"] != str(e):
                         log.warning("SFTP feed could not listen on %s: %s", want["port"], e)
