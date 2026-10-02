@@ -147,4 +147,5 @@ code { font-family: var(--mono); font-size: 13px; background: var(--tint); paddi
 td.wrap { white-space: normal; min-width: 180px; max-width: 360px; }
 .full { width: 100%; }
 .spaced { margin-top: 16px; }
-textarea.mono { min-width: 260px; }
+.row > label:has(> textarea) { flex: 1 1 320px; }
+.row > label > textarea { width: 100%; resize: vertical; }
