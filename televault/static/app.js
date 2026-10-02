@@ -581,7 +581,7 @@ async function viewSftp(main, shown = null) {
   fill();
   if (shown) showPw(...shown);
   const rows = r.accounts.map(a => h("tr", {},
-    h("td", { class: "mono" }, a.username), h("td", {}, a.customer_name), h("td", {}, `last ${a.window_days} days`),
+    h("td", { class: "mono" }, a.username), h("td", {}, a.customer_name), h("td", {}, `latest ${a.window_days} days`, h("br"), h("span", { class: "muted small" }, `${a.window_from.slice(0, 10)} → ${a.window_to.slice(0, 10)}`)),
     h("td", { class: "mono" }, a.allowed_ips.join("\n")),
     h("td", { class: "wrap" }, [a.key_fingerprints.length ? `${a.key_fingerprints.length} key(s)` : null, a.has_password ? "password" : null].filter(Boolean).join(" + ")),
     h("td", {}, a.active ? h("span", { class: "ok" }, "active") : h("b", { class: "error" }, "disabled")),
@@ -593,7 +593,7 @@ async function viewSftp(main, shown = null) {
         try { await api(`/api/admin/sftp/${a.id}`, { method: "DELETE" }); toast("Deleted."); render(); } catch (x) { toast(x.message, true); } } }, "Delete"))));
   main.replaceChildren(
     h("div", { class: "card" }, h("h2", {}, "SFTP feeds · read-only access for external systems"),
-      h("p", { class: "muted" }, "Each feed gives one system (for example an AI vendor) read-only SFTP access to ONE customer's recordings from the last N days of call time, from listed IP addresses only. ",
+      h("p", { class: "muted" }, "Each feed gives one system (for example an AI vendor) read-only SFTP access to ONE customer's latest N days of recordings (counted back from that customer's newest recording, so batch-filled drives still show a full window), from listed IP addresses only. ",
         "Folders and files appear as on the drive; older recordings, empty files and other customers simply don't exist for it. Nothing can be written, renamed or deleted. Every login and file opened is in the audit log."),
       h("p", {}, r.enabled ? ["Server: port ", h("code", {}, String(r.port)), " · host key ", h("code", {}, r.host_fingerprint), " (give this fingerprint to the vendor to verify)."]
         : h("span", { class: "warn-inline" }, "The SFTP server is off. Run scripts\install-sftp.ps1 on the Archive PC (admin) to switch it on and open the firewall for the vendor's addresses.")),

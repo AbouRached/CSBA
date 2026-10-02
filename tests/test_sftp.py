@@ -166,3 +166,27 @@ def test_admin_api_superadmin_only_and_validated(env):
     assert c.get("/api/admin/sftp").json()["accounts"][0]["has_password"] is False
     assert c.delete(f"/api/admin/sftp/{r.json()['id']}", headers=HDR).status_code == 200
     assert [x[0] for x in _audit(env, "admin.sftp.")] == ["admin.sftp.create", "admin.sftp.update", "admin.sftp.delete"]
+
+
+def test_window_counts_back_from_the_newest_recording_not_today(env):
+    """Drive filled in batches: newest Alpha call is 2026-08-20 (weeks ago). A 1-day window
+    still shows 08-20, not 08-19; an undated file with a fresh file time and a call dated in
+    the future must not move the anchor."""
+    with env["db"].conn() as c:
+        c.execute("INSERT INTO sftp_accounts(id, username, customer_id, window_days, allowed_ips_json, public_keys) "
+                  "VALUES (1, 'ai-feed', 1, 1, '[\"127.0.0.1\"]', ?)", (CLIENT_KEY.export_public_key().decode(),))
+        c.execute("UPDATE recordings SET rec_ts = ? WHERE rec_type = 'unknown'",
+                  (datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),))
+        c.execute("UPDATE recordings SET rec_ts = '2099-01-01T00:00:00' WHERE rel_path = ?", (RECENT2,))
+        start, latest = tvsftp.window(c, 1, 1)
+    assert latest == "2026-08-20T11:52:55" and start == "2026-08-19T11:52:55"
+    env["cfg"].sftp_host, env["cfg"].sftp_port = "127.0.0.1", 0
+
+    async def body(port):
+        async with _connect(port) as conn, conn.start_sftp_client() as s:
+            return sorted(await s.listdir("/2026/08")), await s.exists("/" + RECENT), await s.exists("/" + OLD)
+    dirs, recent, old = _run(env, body)
+    assert dirs == [".", "..", "20"] and recent and not old
+    c = env["client"]; login(c, "root")
+    acct = c.get("/api/admin/sftp").json()["accounts"][0]
+    assert (acct["window_from"], acct["window_to"]) == ("2026-08-19T11:52:55", "2026-08-20T11:52:55")

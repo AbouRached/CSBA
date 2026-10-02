@@ -5,7 +5,9 @@ Gates (ADR-0001 item 18):
 - Off unless config `sftp_port` is set. Own port; the Windows firewall rule and the router
   forward are limited to the vendor's addresses (scripts/install-sftp.ps1).
 - Accounts are managed by superadmins in the admin UI (step-up code). Each is pinned to one
-  customer and a window in days of call time; it is not a TeleVault user and has no OS account.
+  customer and a window in days of call time, counted back from that customer's LATEST
+  recording (drives are often filled in batches, so "today" would leave the window empty);
+  it is not a TeleVault user and has no OS account.
 - Every connection must come from the account's allowed IPs (checked here too, not only by the
   firewall). SSH key preferred, or a generated password (Argon2id). Repeated failures from an
   address are refused for a while; addresses on no account's list are dropped at connect.
@@ -115,10 +117,19 @@ def host_fingerprint(cfg: Config) -> str:
     return host_key(cfg).get_fingerprint()
 
 
-def _cutoff(days: int) -> str:
-    """Call time (local, as stored in rec_ts) from which recordings are in the window. Files
-    whose names carry no date were indexed with their file time as rec_ts."""
-    return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+_TS = "%Y-%m-%dT%H:%M:%S"
+
+
+def window(conn, customer_id: int, days: int) -> tuple[str, str]:
+    """(start, latest): the window covers `days` of call time ending at the customer's newest
+    recording. Only names that carry a date anchor it (undated files are indexed with their
+    file time, which can be anything), and nothing dated in the future does."""
+    latest = conn.execute(
+        "SELECT MAX(rec_ts) FROM recordings WHERE customer_id = ? AND empty = 0 "
+        "AND rec_type != 'unknown' AND rec_ts <= ?",
+        (customer_id, datetime.now().strftime(_TS))).fetchone()[0]
+    anchor = datetime.fromisoformat(latest) if latest else datetime.now()
+    return (anchor - timedelta(days=days)).strftime(_TS), anchor.strftime(_TS)
 
 
 _IN_WINDOW = "r.customer_id = ? AND r.empty = 0 AND r.rec_ts >= ?"
@@ -227,7 +238,7 @@ class Feed:
     def _build(self, customer_id: int, days: int) -> Tree:
         with self.db.conn() as c:
             rows = c.execute(f"SELECT r.id, r.rel_path, r.size, r.mtime FROM recordings r WHERE {_IN_WINDOW}",
-                             (customer_id, _cutoff(days))).fetchall()
+                             (customer_id, window(c, customer_id, days)[0])).fetchall()
         return Tree(rows, time.time())
 
     def open_recording(self, acct: dict, entry: Entry, vpath: str, ip: str) -> _Handle:
@@ -240,7 +251,8 @@ class Feed:
             row = c.execute(
                 "SELECT r.rel_path, c.root_path, c.volume_serial FROM recordings r "
                 f"JOIN customers c ON c.id = r.customer_id WHERE r.id = ? AND {_IN_WINDOW}",
-                (entry.rec_id, acct["customer_id"], _cutoff(min(now["window_days"], acct["window_days"])))).fetchone()
+                (entry.rec_id, acct["customer_id"],
+                 window(c, acct["customer_id"], min(now["window_days"], acct["window_days"]))[0])).fetchone()
             if row is None:
                 raise SFTPNoSuchFile("No such file")
             root = Path(row["root_path"]).resolve()

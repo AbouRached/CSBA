@@ -737,7 +737,14 @@ def list_sftp(p: Principal = Depends(require_superadmin), conn: sqlite3.Connecti
     rows = conn.execute("SELECT a.*, c.name AS customer_name FROM sftp_accounts a "
                         "JOIN customers c ON c.id = a.customer_id ORDER BY a.username").fetchall()
     return {"enabled": cfg.sftp_port > 0, "port": cfg.sftp_port,
-            "host_fingerprint": host_fingerprint(cfg), "accounts": [_sftp_json(r) for r in rows]}
+            "host_fingerprint": host_fingerprint(cfg), "accounts": [_sftp_window(conn, r) for r in rows]}
+
+
+def _sftp_window(conn: sqlite3.Connection, r: sqlite3.Row) -> dict:
+    from .sftp import window
+    d = _sftp_json(r)
+    d["window_from"], d["window_to"] = window(conn, r["customer_id"], r["window_days"])
+    return d
 
 
 @router.post("/sftp")
