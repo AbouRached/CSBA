@@ -156,6 +156,24 @@ CREATE TABLE IF NOT EXISTS staff_access (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
+-- Read-only SFTP feed accounts (e.g. an AI vendor): one customer, rolling window of days,
+-- allowed source addresses, SSH keys and/or a generated password. Not TeleVault users.
+CREATE TABLE IF NOT EXISTS sftp_accounts (
+    id                INTEGER PRIMARY KEY,
+    username          TEXT NOT NULL UNIQUE,
+    customer_id       INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    window_days       INTEGER NOT NULL DEFAULT 30 CHECK (window_days BETWEEN 1 AND 366),
+    allowed_ips_json  TEXT NOT NULL DEFAULT '[]',
+    public_keys       TEXT NOT NULL DEFAULT '',
+    password_hash     TEXT,
+    active            INTEGER NOT NULL DEFAULT 1,
+    note              TEXT NOT NULL DEFAULT '',
+    created_by        TEXT NOT NULL DEFAULT '',
+    created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    last_login_at     TEXT,
+    last_ip           TEXT
+);
+
 -- Extra staff networks (CIDR) managed in the admin UI, on top of config.json's staff_networks.
 CREATE TABLE IF NOT EXISTS staff_networks (
     id          INTEGER PRIMARY KEY,

@@ -145,3 +145,6 @@ code { font-family: var(--mono); font-size: 13px; background: var(--tint); paddi
   .main { padding: 12px; }
 }
 td.wrap { white-space: normal; min-width: 180px; max-width: 360px; }
+.full { width: 100%; }
+.spaced { margin-top: 16px; }
+textarea.mono { min-width: 260px; }

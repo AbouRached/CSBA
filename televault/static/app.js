@@ -94,7 +94,7 @@ function render() {
   if (!state.me.mfa_ok) { $("#nav").replaceChildren(); viewMfa(main); return; }
   if (state.me.must_change_password) { state.view = "password"; }
   renderNav();
-  const views = { recordings: viewRecordings, password: viewPassword, customers: viewCustomers, departments: viewDepartments, users: viewUsers, staff: viewStaffAccess, dev: viewDevAccess, audit: viewAudit };
+  const views = { recordings: viewRecordings, password: viewPassword, customers: viewCustomers, departments: viewDepartments, users: viewUsers, staff: viewStaffAccess, sftp: viewSftp, dev: viewDevAccess, audit: viewAudit };
   (views[state.view] || viewRecordings)(main);
 }
 
@@ -103,7 +103,7 @@ function renderNav() {
   if (isAdmin() && !state.me.must_change_password) {
     if (state.me.role === "superadmin") items.push(["customers", "Customers"]);
     items.push(["departments", "Departments"], ["users", "Users"]);
-    if (state.me.role === "superadmin") items.push(["staff", "Staff access"], ["dev", "Developer access"]);
+    if (state.me.role === "superadmin") items.push(["staff", "Staff access"], ["sftp", "SFTP feeds"], ["dev", "Developer access"]);
     items.push(["audit", "Audit log"]);
   }
   items.push(["password", "Password"]);
@@ -409,7 +409,7 @@ function accessCell(c) {
 function customerForm(c = null, existing = null) {
   const form = existing || h("form", { class: "row" });
   setKids(form, 
-    h("h2", { style: "width:100%" }, c ? `Edit ${c.name}` : "Add customer"),
+    h("h2", { class: "full" }, c ? `Edit ${c.name}` : "Add customer"),
     h("label", {}, "Slug", h("input", { name: "slug", value: c?.slug || "", required: "", pattern: "[a-z0-9][a-z0-9-]{1,31}", placeholder: "acme" })),
     h("label", { class: "grow" }, "Name", h("input", { name: "name", value: c?.name || "", required: "", placeholder: "Acme" })),
     h("label", { class: "grow" }, "Recording folder (drive and folder)",
@@ -539,6 +539,69 @@ async function viewDevAccess(main) {
     h("div", { class: "card" }, h("h2", {}, "Create a token"), secretBox, form));
 }
 
+/* ------------------------------------------------------------------ admin: SFTP feeds */
+async function viewSftp(main, shown = null) {
+  const [r, customers] = await Promise.all([api("/api/admin/sftp"), api("/api/admin/customers")]);
+  const secretBox = h("div", { hidden: "" });
+  const showPw = (user, pw) => {
+    secretBox.hidden = false;
+    secretBox.replaceChildren(h("p", {}, h("b", {}, `Password for ${user}`), " — shown once. Send it to the vendor over a different channel than the username."),
+      h("div", { class: "secret" }, pw), h("br"));
+  };
+  const form = h("form", { class: "row" });
+  const fill = (a = null) => {
+    setKids(form,
+      h("h2", { class: "full" }, a ? `Edit ${a.username}` : "Add a feed"),
+      h("label", {}, "Username", h("input", { name: "username", required: "", value: a?.username || "", placeholder: "vendor-ai", class: "mono" })),
+      h("label", {}, "Customer", h("select", { name: "customer_id" }, ...customers.map(c => h("option", { value: c.id, selected: a?.customer_id === c.id ? "" : null }, c.name)))),
+      h("label", {}, "Days of recordings", h("input", { name: "window_days", type: "number", min: "1", max: "366", value: a?.window_days || 30 })),
+      h("label", {}, "Active", h("select", { name: "active" }, h("option", { value: "1" }, "yes"), h("option", { value: "0", selected: a && !a.active ? "" : null }, "no"))),
+      h("label", { class: "grow" }, "Vendor's IP addresses (one per line)", h("textarea", { name: "allowed_ips", rows: "3", class: "mono", required: "", placeholder: "203.0.113.7\n198.51.100.0/28" }, (a?.allowed_ips || []).join("\n"))),
+      h("label", { class: "grow" }, "Vendor's SSH public key(s) — preferred", h("textarea", { name: "public_keys", rows: "3", class: "mono", placeholder: "ssh-ed25519 AAAA... vendor" }, a?.public_keys || "")),
+      h("label", {}, a?.has_password ? "Password" : "Password (if they can't use a key)", h("select", { name: "pw" },
+        h("option", { value: "keep" }, a?.has_password ? "keep current" : "none"),
+        h("option", { value: "new" }, a?.has_password ? "generate a new one" : "generate one"),
+        a?.has_password ? h("option", { value: "remove" }, "remove (key only)") : null)),
+      h("label", { class: "grow" }, "Note", h("input", { name: "note", value: a?.note || "", placeholder: "vendor / contract / contact" })),
+      h("button", { class: "btn primary", type: "submit" }, a ? "Save" : "Create feed"),
+      a ? h("button", { class: "btn", type: "button", onclick: () => fill() }, "Cancel") : null);
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      const body = { username: form.username.value.trim(), customer_id: Number(form.customer_id.value),
+        window_days: Number(form.window_days.value), active: form.active.value === "1",
+        allowed_ips: form.allowed_ips.value.split(/[\s,]+/).filter(Boolean), public_keys: form.public_keys.value,
+        generate_password: form.pw.value === "new", remove_password: form.pw.value === "remove", note: form.note.value };
+      try {
+        const res = a ? await api(`/api/admin/sftp/${a.id}`, { method: "PUT", body }) : await api("/api/admin/sftp", { method: "POST", body });
+        toast(a ? "Saved." : "Feed created.");
+        await viewSftp(main, res.password ? [body.username, res.password] : null);
+      } catch (x) { toast(x.message, true); }
+    };
+  };
+  fill();
+  if (shown) showPw(...shown);
+  const rows = r.accounts.map(a => h("tr", {},
+    h("td", { class: "mono" }, a.username), h("td", {}, a.customer_name), h("td", {}, `last ${a.window_days} days`),
+    h("td", { class: "mono" }, a.allowed_ips.join("\n")),
+    h("td", { class: "wrap" }, [a.key_fingerprints.length ? `${a.key_fingerprints.length} key(s)` : null, a.has_password ? "password" : null].filter(Boolean).join(" + ")),
+    h("td", {}, a.active ? h("span", { class: "ok" }, "active") : h("b", { class: "error" }, "disabled")),
+    h("td", { class: "muted" }, a.last_login_at ? `${fmtTs(a.last_login_at)} · ${a.last_ip}` : "never"),
+    h("td", { class: "actions" },
+      h("button", { class: "btn small", type: "button", onclick: () => { fill(a); form.scrollIntoView({ behavior: "smooth" }); } }, "Edit"),
+      h("button", { class: "btn small danger", type: "button", onclick: async () => {
+        if (!confirm(`Delete feed ${a.username}? The vendor loses access immediately for new files.`)) return;
+        try { await api(`/api/admin/sftp/${a.id}`, { method: "DELETE" }); toast("Deleted."); render(); } catch (x) { toast(x.message, true); } } }, "Delete"))));
+  main.replaceChildren(
+    h("div", { class: "card" }, h("h2", {}, "SFTP feeds · read-only access for external systems"),
+      h("p", { class: "muted" }, "Each feed gives one system (for example an AI vendor) read-only SFTP access to ONE customer's recordings from the last N days of call time, from listed IP addresses only. ",
+        "Folders and files appear as on the drive; older recordings, empty files and other customers simply don't exist for it. Nothing can be written, renamed or deleted. Every login and file opened is in the audit log."),
+      h("p", {}, r.enabled ? ["Server: port ", h("code", {}, String(r.port)), " · host key ", h("code", {}, r.host_fingerprint), " (give this fingerprint to the vendor to verify)."]
+        : h("span", { class: "warn-inline" }, "The SFTP server is off. Run scripts\install-sftp.ps1 on the Archive PC (admin) to switch it on and open the firewall for the vendor's addresses.")),
+      h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Username", "Customer", "Window", "Allowed from", "Sign-in", "Status", "Last login", ""].map(x => h("th", {}, x)))),
+        h("tbody", {}, ...rows, r.accounts.length ? null : h("tr", {}, h("td", { colspan: "8", class: "muted" }, "No feeds yet.")))))),
+    h("div", { class: "card" }, secretBox, form));
+}
+
 /* ------------------------------------------------------------------ admin: staff access */
 async function viewStaffAccess(main) {
   const [list, nets] = await Promise.all([api("/api/admin/staff-access"), api("/api/admin/staff-networks")]);
@@ -568,7 +631,7 @@ async function viewStaffAccess(main) {
           h("button", { class: "btn small danger", type: "button", onclick: async () => {
             if (!confirm(`Remove ${n.cidr}? Superadmins there will need the staff-email check.`)) return;
             try { await api(`/api/admin/staff-networks/${n.id}`, { method: "DELETE" }); toast("Removed."); render(); } catch (x) { toast(x.message, true); } } }, "Remove"))))))),
-    h("h2", { style: "margin-top:16px" }, "Allow a network"), netForm);
+    h("h2", { class: "spaced" }, "Allow a network"), netForm);
   const form = h("form", { class: "row" },
     h("label", { class: "grow" }, "Email or domain", h("input", { name: "pattern", required: "", placeholder: "name@anydomain.com  or  @anydomain.com", class: "mono" })),
     h("label", { class: "grow" }, "Note", h("input", { name: "note", placeholder: "who / why" })),
@@ -651,7 +714,7 @@ async function viewDepartments(main) {
 function deptForm(cid, d = null, existing = null) {
   const form = existing || h("form", { class: "row" });
   setKids(form, 
-    h("h2", { style: "width:100%" }, d ? `Edit ${d.name}` : "Add department"),
+    h("h2", { class: "full" }, d ? `Edit ${d.name}` : "Add department"),
     h("label", {}, "Name", h("input", { name: "name", value: d?.name || "", required: "", placeholder: "Support" })),
     h("label", { class: "grow" }, "Extensions", h("input", { name: "extensions", value: d?.extensions.join(", ") || "", placeholder: "436, 437, 851" })),
     h("label", {}, "Queues", h("input", { name: "queues", value: d?.queues.join(", ") || "", placeholder: "126, 131" })),
@@ -733,7 +796,7 @@ function userForm(customers, depts, u = null, existing = null) {
     form.querySelector(".superadmin-note").hidden = r !== "superadmin";
   };
   setKids(form,
-    h("h2", { style: "width:100%" }, u ? `Edit ${u.username}` : "Add user"),
+    h("h2", { class: "full" }, u ? `Edit ${u.username}` : "Add user"),
     h("label", {}, "Username", h("input", { name: "username", value: u?.username || "", required: "", placeholder: "j.doe" })),
     h("label", {}, "Display name", h("input", { name: "display_name", value: u?.display_name || "" })),
     h("label", {}, "Role", h("select", { name: "role", onchange: show },
@@ -746,7 +809,7 @@ function userForm(customers, depts, u = null, existing = null) {
     h("label", { class: "grow" }, "Customers (ctrl-click for several)",
       h("select", { name: "custs", multiple: "", size: "6" },
         ...customers.map(c => h("option", { value: c.id, selected: u?.customer_ids.includes(c.id) ? "" : null }, `${c.name} (${c.slug})`)))),
-    h("p", { class: "muted small superadmin-note", style: "width:100%" }, "Superadmins see and manage every customer, only from the office network or with verified staff email, and must set up Microsoft Authenticator at first sign-in."),
+    h("p", { class: "muted small superadmin-note", class: "full" }, "Superadmins see and manage every customer, only from the office network or with verified staff email, and must set up Microsoft Authenticator at first sign-in."),
     h("label", {}, "Active", h("select", { name: "active" }, h("option", { value: "1", selected: (u ? u.active : true) ? "" : null }, "yes"), h("option", { value: "0", selected: u && !u.active ? "" : null }, "no"))),
     u ? null : h("label", {}, "Initial password (blank = generate)", h("input", { name: "password", type: "password", autocomplete: "new-password" })),
     h("button", { class: "btn primary", type: "submit" }, u ? "Save" : "Create"),
@@ -779,7 +842,7 @@ async function viewAudit(main) {
   main.replaceChildren(h("div", { class: "card" }, h("h2", {}, "Audit log"),
     picker ? h("div", { class: "row" }, picker) : null,
     h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Time (UTC)", "User", "IP", "Action", "Detail"].map(t => h("th", {}, t)))),
-      h("tbody", {}, ...data.items.map(r => h("tr", {}, h("td", { class: "mono" }, fmtTs(r.ts)), h("td", { class: "mono" }, r.username), h("td", { class: "mono" }, r.ip), h("td", {}, r.action), h("td", { class: "mono", style: "white-space:normal" }, r.detail)))))),
+      h("tbody", {}, ...data.items.map(r => h("tr", {}, h("td", { class: "mono" }, fmtTs(r.ts)), h("td", { class: "mono" }, r.username), h("td", { class: "mono" }, r.ip), h("td", {}, r.action), h("td", { class: "mono wrap" }, r.detail)))))),
     h("div", { class: "pager" }, h("span", { class: "muted" }, `${data.total.toLocaleString()} entries`),
       h("button", { class: "btn small", type: "button", disabled: state.page <= 1 ? "" : null, onclick: () => { state.page--; viewAudit(main); } }, "‹ Prev"),
       h("span", {}, `Page ${data.page} / ${pages}`),

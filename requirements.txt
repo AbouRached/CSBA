@@ -7,3 +7,4 @@ segno>=1.6
 pyjwt[crypto]>=2.8
 pytest>=8
 httpx>=0.27
+asyncssh>=2.17

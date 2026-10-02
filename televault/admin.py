@@ -686,6 +686,124 @@ def remove_staff_access(sid: int, request: Request, p: Principal = Depends(requi
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- SFTP feeds (read-only, external systems)
+
+class SftpAccountIn(BaseModel):
+    username: str = Field(min_length=3, max_length=32)
+    customer_id: int
+    window_days: int = Field(default=30, ge=1, le=366)
+    allowed_ips: list[str] = Field(default_factory=list, max_length=50)
+    public_keys: str = Field(default="", max_length=20000)
+    generate_password: bool = False
+    remove_password: bool = False
+    note: str = Field(default="", max_length=200)
+    active: bool = True
+
+
+def _sftp_json(r: sqlite3.Row) -> dict:
+    from .sftp import key_fingerprints
+    d = {k: r[k] for k in r.keys() if k not in ("password_hash", "allowed_ips_json")}
+    d["allowed_ips"] = json.loads(r["allowed_ips_json"] or "[]")
+    d["has_password"] = bool(r["password_hash"])
+    d["key_fingerprints"] = key_fingerprints(r["public_keys"])
+    d["active"] = bool(r["active"])
+    return d
+
+
+def _sftp_validate(conn: sqlite3.Connection, body: SftpAccountIn) -> tuple[str, list[str]]:
+    from .sftp import USERNAME_RE, parse_keys, parse_networks
+    username = body.username.strip().lower()
+    if not USERNAME_RE.match(username):
+        raise HTTPException(400, "Username: 3-32 characters, lowercase letters, digits, dot, dash, underscore.")
+    if conn.execute("SELECT 1 FROM customers WHERE id = ?", (body.customer_id,)).fetchone() is None:
+        raise HTTPException(400, "Unknown customer.")
+    try:
+        nets = parse_networks(body.allowed_ips)
+        parse_keys(body.public_keys)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return username, nets
+
+
+def _sftp_password() -> tuple[str, str]:
+    pw = secrets.token_urlsafe(18)
+    return pw, hash_password(pw)
+
+
+@router.get("/sftp")
+def list_sftp(p: Principal = Depends(require_superadmin), conn: sqlite3.Connection = Depends(get_conn),
+              cfg: Config = Depends(get_cfg)):
+    from .sftp import host_fingerprint
+    rows = conn.execute("SELECT a.*, c.name AS customer_name FROM sftp_accounts a "
+                        "JOIN customers c ON c.id = a.customer_id ORDER BY a.username").fetchall()
+    return {"enabled": cfg.sftp_port > 0, "port": cfg.sftp_port,
+            "host_fingerprint": host_fingerprint(cfg), "accounts": [_sftp_json(r) for r in rows]}
+
+
+@router.post("/sftp")
+def create_sftp(body: SftpAccountIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                conn: sqlite3.Connection = Depends(get_conn)):
+    username, nets = _sftp_validate(conn, body)
+    pw, pw_hash = _sftp_password() if body.generate_password else (None, None)
+    if not body.public_keys.strip() and not pw:
+        raise HTTPException(400, "Add the vendor's SSH public key, or generate a password.")
+    try:
+        cur = conn.execute(
+            "INSERT INTO sftp_accounts(username, customer_id, window_days, allowed_ips_json, public_keys, "
+            "password_hash, active, note, created_by) VALUES (?,?,?,?,?,?,?,?,?)",
+            (username, body.customer_id, body.window_days, json.dumps(nets), body.public_keys.strip(), pw_hash,
+             int(body.active), body.note.strip(), p.username))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "That username is taken.")
+    audit.log(conn, "admin.sftp.create", user_id=p.user_id, username=p.username, customer_id=body.customer_id,
+              ip=client_ip(request), detail=f"{username} days={body.window_days} ips={','.join(nets)} "
+                                            f"keys={len(_sftp_keys(body))} password={'yes' if pw else 'no'}")
+    return {"id": cur.lastrowid, "password": pw}
+
+
+def _sftp_keys(body: SftpAccountIn) -> list:
+    from .sftp import parse_keys
+    return parse_keys(body.public_keys)
+
+
+@router.put("/sftp/{aid}")
+def update_sftp(aid: int, body: SftpAccountIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                conn: sqlite3.Connection = Depends(get_conn)):
+    row = conn.execute("SELECT * FROM sftp_accounts WHERE id = ?", (aid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No such SFTP account.")
+    username, nets = _sftp_validate(conn, body)
+    pw, pw_hash = _sftp_password() if body.generate_password else (None, row["password_hash"])
+    if body.remove_password and not body.generate_password:
+        pw_hash = None
+    if not body.public_keys.strip() and not pw_hash:
+        raise HTTPException(400, "Keep at least one SSH key or a password.")
+    try:
+        conn.execute("UPDATE sftp_accounts SET username=?, customer_id=?, window_days=?, allowed_ips_json=?, "
+                     "public_keys=?, password_hash=?, active=?, note=? WHERE id = ?",
+                     (username, body.customer_id, body.window_days, json.dumps(nets), body.public_keys.strip(),
+                      pw_hash, int(body.active), body.note.strip(), aid))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "That username is taken.")
+    audit.log(conn, "admin.sftp.update", user_id=p.user_id, username=p.username, customer_id=body.customer_id,
+              ip=client_ip(request), detail=f"{username} days={body.window_days} ips={','.join(nets)} "
+                                            f"keys={len(_sftp_keys(body))} active={int(body.active)}"
+                                            + (" new-password" if pw else "") + (" password-removed" if body.remove_password else ""))
+    return {"ok": True, "password": pw}
+
+
+@router.delete("/sftp/{aid}")
+def delete_sftp(aid: int, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                conn: sqlite3.Connection = Depends(get_conn)):
+    row = conn.execute("SELECT username, customer_id FROM sftp_accounts WHERE id = ?", (aid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No such SFTP account.")
+    conn.execute("DELETE FROM sftp_accounts WHERE id = ?", (aid,))
+    audit.log(conn, "admin.sftp.delete", user_id=p.user_id, username=p.username, customer_id=row["customer_id"],
+              ip=client_ip(request), detail=row["username"])
+    return {"ok": True}
+
+
 # ---------------------------------------------------------------- staff networks (office / VPN)
 
 class StaffNetworkIn(BaseModel):

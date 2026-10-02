@@ -55,6 +55,10 @@ DEFAULTS = {
     # Local MCP endpoint for troubleshooting/development tools (Claude Code etc.).
     # Always bound to 127.0.0.1; 0 disables it.
     "mcp_port": 8765,
+    # Read-only SFTP feed for external systems (accounts managed in the admin UI).
+    # 0 = off. Listens on sftp_host; firewall it to the vendor's addresses (install-sftp.ps1).
+    "sftp_port": 0,
+    "sftp_host": "0.0.0.0",
     # Operator name shown in the authenticator app, MCP server title and TLS certificate.
     "vendor_name": "",
 }
@@ -91,6 +95,8 @@ class Config:
     staff_emails: list[str] = field(default_factory=list)
     service_account: str = "televault-svc"
     mcp_port: int = 8765
+    sftp_port: int = 0
+    sftp_host: str = "0.0.0.0"
     vendor_name: str = ""
 
     @property
@@ -148,6 +154,8 @@ def load_config() -> Config:
         staff_emails=[str(e).strip().lower() for e in raw["staff_emails"] if str(e).strip()],
         service_account=str(raw["service_account"]).strip(),
         mcp_port=int(raw["mcp_port"]),
+        sftp_port=int(raw["sftp_port"]),
+        sftp_host=str(raw["sftp_host"]).strip(),
         vendor_name=str(raw["vendor_name"]).strip(),
     )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)

@@ -127,6 +127,9 @@ def run() -> None:
         log.info("MCP endpoint on http://127.0.0.1:%d/mcp", cfg.mcp_port)
 
     async def serve_all():
+        if cfg.sftp_port:
+            from .sftp import start as start_sftp
+            await start_sftp(cfg, app.state.db)   # runs on this event loop until the process exits
         await asyncio.gather(*(s.serve() for s in servers))
 
     asyncio.run(serve_all())
