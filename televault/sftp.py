@@ -482,7 +482,7 @@ def firewall_plan(conn, cfg: Config) -> dict:
     ips: set[str] = set()
     for (j,) in conn.execute("SELECT allowed_ips_json FROM sftp_accounts WHERE active = 1"):
         ips.update(json.loads(j or "[]"))
-    return {"enabled": s["enabled"] and s["mode"] == "direct", "port": s["port"], "ips": sorted(ips)}
+    return {"enabled": s["enabled"] and s["mode"] == "direct", "mode": s["mode"], "port": s["port"], "ips": sorted(ips)}
 
 
 STATUS: dict = {"listening": False, "port": None, "error": ""}

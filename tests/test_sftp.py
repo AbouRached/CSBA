@@ -228,7 +228,7 @@ def test_server_settings_api_and_firewall_plan(env, capsys, monkeypatch):
     from televault import cli
     monkeypatch.setattr(cli, "load_config", lambda: env["cfg"])
     assert cli.main(["sftp-firewall", "plan"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"enabled": True, "port": 2222, "ips": ["198.51.100.7/32", "203.0.113.0/24"]}
+    assert json.loads(capsys.readouterr().out) == {"enabled": True, "mode": "direct", "port": 2222, "ips": ["198.51.100.7/32", "203.0.113.0/24"]}
     for _ in range(2):   # same report twice = one audit entry
         assert cli.main(["sftp-firewall", "report", "--state", "open", "--message", "TCP 2222 open"]) == 0
     fw = c.get("/api/admin/sftp").json()["server"]["firewall"]

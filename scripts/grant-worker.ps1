@@ -100,7 +100,7 @@ try {
     if (-not $plan.enabled -or $ips.Count -eq 0) {
         $existing | Remove-NetFirewallRule -ErrorAction SilentlyContinue
         $fwState = "closed"
-        $fwMsg = if ($plan.enabled) { "no active feed with IP addresses yet" } else { "SFTP feed is switched off" }
+        $fwMsg = if ($plan.enabled) { "no active feed with IP addresses yet" } elseif ($plan.mode -eq "tunnel") { "not needed: reached through the Cloudflare tunnel" } else { "SFTP feed is switched off" }
     } else {
         $desc = "TeleVault SFTP feed, managed by grant-worker.ps1. port=$port from=$($ips -join ',')"
         if (-not ($existing.Count -eq 1 -and $existing[0].Description -eq $desc -and "$($existing[0].Enabled)" -eq "True")) {
