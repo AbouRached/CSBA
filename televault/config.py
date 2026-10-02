@@ -55,8 +55,8 @@ DEFAULTS = {
     # Local MCP endpoint for troubleshooting/development tools (Claude Code etc.).
     # Always bound to 127.0.0.1; 0 disables it.
     "mcp_port": 8765,
-    # Read-only SFTP feed for external systems (accounts managed in the admin UI).
-    # 0 = off. Listens on sftp_host; firewall it to the vendor's addresses (install-sftp.ps1).
+    # Read-only SFTP feed for external systems. First defaults only: on/off and the port are
+    # set on the SFTP feeds page; the SYSTEM grant worker keeps the firewall rule in step.
     "sftp_port": 0,
     "sftp_host": "0.0.0.0",
     # Operator name shown in the authenticator app, MCP server title and TLS certificate.

@@ -580,6 +580,27 @@ async function viewSftp(main, shown = null) {
   };
   fill();
   if (shown) showPw(...shown);
+  const sv = r.server;
+  const vendorText = (a) => [
+    `SFTP access to ${a.customer_name} call recordings (read-only)`,
+    `Host: ${sv.public_host || "<public address - set it above>"}`,
+    `Port: ${sv.port}`,
+    `Username: ${a.username}`,
+    `Sign-in: ${a.key_fingerprints.length ? "your SSH key (the public key you sent us)" : ""}${a.key_fingerprints.length && a.has_password ? " or " : ""}${a.has_password ? "the password we send you separately" : ""}`,
+    `Server host key (verify on first connect): ${r.host_fingerprint}`,
+    `Content: folders YYYY/MM/DD with the latest ${a.window_days} days of recordings; older files disappear automatically.`,
+    `Connections are accepted only from: ${a.allowed_ips.join(", ")}`,
+  ].join("\n");
+  const details = h("div", { hidden: "" });
+  const showDetails = (a) => {
+    const text = vendorText(a);
+    details.hidden = false;
+    details.replaceChildren(h("h2", {}, `Details to send for ${a.username}`), h("div", { class: "secret" }, text),
+      h("div", { class: "row spaced" },
+        h("button", { class: "btn", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(text); toast("Copied."); } catch { toast("Select the text and copy it.", true); } } }, "Copy"),
+        h("button", { class: "btn", type: "button", onclick: () => { details.hidden = true; } }, "Close")));
+    details.scrollIntoView({ behavior: "smooth" });
+  };
   const rows = r.accounts.map(a => h("tr", {},
     h("td", { class: "mono" }, a.username), h("td", {}, a.customer_name), h("td", {}, `latest ${a.window_days} days`, h("br"), h("span", { class: "muted small" }, `${a.window_from.slice(0, 10)} → ${a.window_to.slice(0, 10)}`)),
     h("td", { class: "mono" }, a.allowed_ips.join("\n")),
@@ -587,18 +608,49 @@ async function viewSftp(main, shown = null) {
     h("td", {}, a.active ? h("span", { class: "ok" }, "active") : h("b", { class: "error" }, "disabled")),
     h("td", { class: "muted" }, a.last_login_at ? `${fmtTs(a.last_login_at)} · ${a.last_ip}` : "never"),
     h("td", { class: "actions" },
+      h("button", { class: "btn small", type: "button", onclick: () => showDetails(a) }, "Vendor details"),
       h("button", { class: "btn small", type: "button", onclick: () => { fill(a); form.scrollIntoView({ behavior: "smooth" }); } }, "Edit"),
       h("button", { class: "btn small danger", type: "button", onclick: async () => {
-        if (!confirm(`Delete feed ${a.username}? The vendor loses access immediately for new files.`)) return;
+        if (!confirm(`Delete feed ${a.username}? The vendor is disconnected and loses access immediately.`)) return;
         try { await api(`/api/admin/sftp/${a.id}`, { method: "DELETE" }); toast("Deleted."); render(); } catch (x) { toast(x.message, true); } } }, "Delete"))));
+
+  // server: on/off, port, public address + live status of listener, firewall and router step
+  const srvForm = h("form", { class: "row" },
+    h("label", {}, "SFTP server", h("select", { name: "enabled" }, h("option", { value: "1", selected: sv.enabled ? "" : null }, "on"), h("option", { value: "0", selected: sv.enabled ? null : "" }, "off"))),
+    h("label", {}, "Port", h("input", { name: "port", type: "number", min: "1024", max: "65535", value: sv.port })),
+    h("label", { class: "grow" }, "Public address the vendor connects to", h("input", { name: "public_host", value: sv.public_host, placeholder: "sftp.example.com or 203.0.113.10", class: "mono" })),
+    h("button", { class: "btn primary", type: "submit" }, "Save"));
+  srvForm.onsubmit = async (e) => {
+    e.preventDefault();
+    const on = srvForm.enabled.value === "1";
+    if (!on && sv.enabled && !confirm("Switch the SFTP server off? Every vendor is disconnected and the firewall closes within a minute.")) return;
+    try {
+      await api("/api/admin/sftp/server", { method: "PUT", body: { enabled: on, port: Number(srvForm.port.value), public_host: srvForm.public_host.value.trim() } });
+      toast(on ? "Saved - the server and firewall follow within a minute." : "Switched off."); render();
+    } catch (x) { toast(x.message, true); }
+  };
+  const fw = sv.firewall;
+  const fwAge = fw.at ? (Date.now() - Date.parse(fw.at)) / 60000 : Infinity;
+  const statusLine = (label, good, text) => h("li", {}, h("b", {}, label + ": "), good === null ? h("span", { class: "muted" }, text) : h("span", { class: good ? "ok" : "warn-inline" }, text));
+  const status = h("ul", { class: "status-list" },
+    statusLine("Server", sv.enabled ? sv.listening : null,
+      !sv.enabled ? "off" : sv.listening ? `listening on port ${sv.port}` : (sv.listen_error ? `not listening - ${sv.listen_error}` : "starting (refresh in a few seconds)")),
+    statusLine("Windows firewall", fwAge > 3 ? false : fw.state === "open" ? true : fw.state === "error" ? false : null,
+      fwAge > 3 ? "no report from the TeleVault Grant Worker task in the last minutes - is it installed and running?" : `${fw.message} (checked ${fmtTs(fw.at)})`),
+    statusLine("Router (network team)", null, sv.enabled && sv.allowed_ips.length
+      ? `forward public TCP ${sv.port}${sv.public_host ? ` on ${sv.public_host}` : ""} → ${sv.lan_ip || "this PC"}:${sv.port}, allowed only from ${sv.allowed_ips.join(", ")}`
+      : "nothing to forward yet"),
+    h("li", {}, h("b", {}, "Host key: "), h("code", {}, r.host_fingerprint), h("span", { class: "muted" }, " - vendors verify this on first connect")));
+
   main.replaceChildren(
     h("div", { class: "card" }, h("h2", {}, "SFTP feeds · read-only access for external systems"),
       h("p", { class: "muted" }, "Each feed gives one system (for example an AI vendor) read-only SFTP access to ONE customer's latest N days of recordings (counted back from that customer's newest recording, so batch-filled drives still show a full window), from listed IP addresses only. ",
         "Folders and files appear as on the drive; older recordings, empty files and other customers simply don't exist for it. Nothing can be written, renamed or deleted. Every login and file opened is in the audit log."),
-      h("p", {}, r.enabled ? ["Server: port ", h("code", {}, String(r.port)), " · host key ", h("code", {}, r.host_fingerprint), " (give this fingerprint to the vendor to verify)."]
-        : h("span", { class: "warn-inline" }, "The SFTP server is off. Run scripts\install-sftp.ps1 on the Archive PC (admin) to switch it on and open the firewall for the vendor's addresses.")),
+      status, srvForm),
+    h("div", { class: "card" }, h("h2", {}, "Feeds"),
       h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Username", "Customer", "Window", "Allowed from", "Sign-in", "Status", "Last login", ""].map(x => h("th", {}, x)))),
-        h("tbody", {}, ...rows, r.accounts.length ? null : h("tr", {}, h("td", { colspan: "8", class: "muted" }, "No feeds yet.")))))),
+        h("tbody", {}, ...rows, r.accounts.length ? null : h("tr", {}, h("td", { colspan: "8", class: "muted" }, "No feeds yet."))))),
+      details),
     h("div", { class: "card" }, secretBox, form));
 }
 

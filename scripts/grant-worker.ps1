@@ -64,3 +64,54 @@ foreach ($j in @($jobs)) {
         & $py -m televault.cli grant-queue finish --id $j.id --status error --message "Failed: $($_.Exception.Message)" | Out-Null
     }
 }
+
+# ---------------------------------------------------------------- SFTP feed firewall rule
+# Superadmins switch the read-only SFTP feed on/off, pick its port and list each vendor's
+# addresses in the web UI. The app can only STATE what it wants; this SYSTEM script
+# re-validates it and touches nothing but its own inbound TCP rule (ADR-0001 #18):
+#   - port 1024-65535 and never the web/MCP ports
+#   - every address a single IP or a network no wider than /16 (IPv4) or /48 (IPv6), max 50
+#   - switched off, or no active feed with addresses = no rule at all; on any doubt the rule
+#     is removed (fail closed)
+$fwName = "TeleVault SFTP feed"
+function Test-FwAddress([string]$a) {
+    $parts = $a.Split('/')
+    if ($parts.Count -gt 2) { return $false }
+    $ip = $null
+    if (-not [System.Net.IPAddress]::TryParse($parts[0], [ref]$ip)) { return $false }
+    $max = 32; $min = 16
+    if ($ip.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) { $max = 128; $min = 48 }
+    $len = $max
+    if ($parts.Count -eq 2 -and -not [int]::TryParse($parts[1], [ref]$len)) { return $false }
+    return ($len -ge $min -and $len -le $max)
+}
+$fwState = "error"; $fwMsg = ""
+try {
+    $planJson = & $py -m televault.cli sftp-firewall plan
+    if ($LASTEXITCODE -ne 0) { throw "could not read the SFTP settings" }
+    $plan = $planJson | ConvertFrom-Json
+    $port = [int]$plan.port
+    $ips = @($plan.ips | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $existing = @(Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue)
+    $bad = @($ips | Where-Object { -not (Test-FwAddress $_) })
+    if ($port -lt 1024 -or $port -gt 65535 -or $port -in 8443, 8765) { throw "port $port is not allowed" }
+    if ($bad.Count) { throw "refused addresses: $($bad -join ', ')" }
+    if ($ips.Count -gt 50) { throw "more than 50 addresses" }
+    if (-not $plan.enabled -or $ips.Count -eq 0) {
+        $existing | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+        $fwState = "closed"
+        $fwMsg = if ($plan.enabled) { "no active feed with IP addresses yet" } else { "SFTP feed is switched off" }
+    } else {
+        $desc = "TeleVault SFTP feed, managed by grant-worker.ps1. port=$port from=$($ips -join ',')"
+        if (-not ($existing.Count -eq 1 -and $existing[0].Description -eq $desc -and "$($existing[0].Enabled)" -eq "True")) {
+            $existing | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName $fwName -Description $desc -Direction Inbound -Action Allow -Protocol TCP `
+                -LocalPort $port -RemoteAddress $ips -Profile Any | Out-Null
+        }
+        $fwState = "open"; $fwMsg = "TCP $port open only from $($ips -join ', ')"
+    }
+} catch {
+    Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+    $fwState = "error"; $fwMsg = "Rule removed: $($_.Exception.Message)"
+}
+& $py -m televault.cli sftp-firewall report --state $fwState --message $fwMsg | Out-Null

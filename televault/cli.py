@@ -199,6 +199,30 @@ def cmd_grant_queue(args) -> int:
     return 0
 
 
+def cmd_sftp_firewall(args) -> int:
+    """Used only by scripts/grant-worker.ps1 (SYSTEM). 'plan' prints the SFTP feed firewall
+    rule the app wants (the worker re-validates it); 'report' stores what the worker did, for
+    the SFTP feeds page, and audits changes of state."""
+    import json
+    from . import audit
+    from .sftp import firewall_plan
+    cfg = load_config()
+    audit.configure(cfg.audit_to_eventlog)
+    db = Database(cfg.db_path)
+    with db.conn() as c:
+        if args.action == "plan":
+            print(json.dumps(firewall_plan(c, cfg)))
+            return 0
+        old = {r[0]: r[1] for r in c.execute("SELECT key, value FROM settings WHERE key IN ('sftp_fw_state','sftp_fw_message')")}
+        now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        for k, v in (("sftp_fw_state", args.state), ("sftp_fw_message", args.message or ""), ("sftp_fw_at", now)):
+            c.execute("INSERT INTO settings(key, value, updated_by) VALUES (?,?, 'grant-worker') "
+                      "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at", (k, v))
+        if old.get("sftp_fw_state") != args.state or old.get("sftp_fw_message") != (args.message or ""):
+            audit.log(c, f"system.sftp_firewall.{args.state}", username="grant-worker", detail=args.message or "")
+    return 0
+
+
 def cmd_mcp_token(args) -> int:
     """Console token management for the local MCP endpoint (the admin UI does the same)."""
     from .mcp_server import create_token
@@ -373,6 +397,12 @@ def main(argv: list[str] | None = None) -> int:
     gq.add_argument("--status", choices=["done", "error"])
     gq.add_argument("--message", default="")
     gq.set_defaults(fn=cmd_grant_queue)
+
+    sf = sub.add_parser("sftp-firewall", help="(grant worker) SFTP feed firewall plan / report")
+    sf.add_argument("action", choices=["plan", "report"])
+    sf.add_argument("--state", choices=["open", "closed", "error"])
+    sf.add_argument("--message", default="")
+    sf.set_defaults(fn=cmd_sftp_firewall)
 
     bk = sub.add_parser("backup", help="back up database + mfa.key + TLS pair")
     bk.add_argument("dest", help="backup folder, e.g. C:\\TeleVaultBackups")

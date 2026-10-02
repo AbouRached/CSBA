@@ -190,3 +190,79 @@ def test_window_counts_back_from_the_newest_recording_not_today(env):
     c = env["client"]; login(c, "root")
     acct = c.get("/api/admin/sftp").json()["accounts"][0]
     assert (acct["window_from"], acct["window_to"]) == ("2026-08-19T11:52:55", "2026-08-20T11:52:55")
+
+
+# ---------------------------------------------------------------- server switch from the UI
+
+def _free_port() -> int:
+    import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def test_server_settings_api_and_firewall_plan(env, capsys, monkeypatch):
+    c = env["client"]; login(c, "root")
+    assert c.put("/api/admin/sftp/server", json={"enabled": True, "port": 8443}, headers=HDR).status_code == 400
+    assert c.put("/api/admin/sftp/server", json={"enabled": True, "port": 22}, headers=HDR).status_code == 422
+    assert c.put("/api/admin/sftp/server", json={"enabled": True, "port": 2222, "public_host": "bad host!"},
+                 headers=HDR).status_code == 400
+    r = c.put("/api/admin/sftp/server", json={"enabled": True, "port": 2222, "public_host": "SFTP.Example.com"}, headers=HDR)
+    assert r.status_code == 200
+    key = CLIENT_KEY.export_public_key().decode()
+    c.post("/api/admin/sftp", json={"username": "ai-feed", "customer_id": 1, "allowed_ips": ["198.51.100.7", "203.0.113.0/24"],
+                                    "public_keys": key}, headers=HDR)
+    c.post("/api/admin/sftp", json={"username": "old-feed", "customer_id": 1, "allowed_ips": ["192.0.2.9"],
+                                    "public_keys": key, "active": False}, headers=HDR)
+    srv = c.get("/api/admin/sftp").json()["server"]
+    assert srv["enabled"] and srv["port"] == 2222 and srv["public_host"] == "sftp.example.com"
+    assert srv["allowed_ips"] == ["198.51.100.7/32", "203.0.113.0/24"]           # disabled feed not opened
+    # what the SYSTEM worker reads, and what it reports back
+    from televault import cli
+    monkeypatch.setattr(cli, "load_config", lambda: env["cfg"])
+    assert cli.main(["sftp-firewall", "plan"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"enabled": True, "port": 2222, "ips": ["198.51.100.7/32", "203.0.113.0/24"]}
+    for _ in range(2):   # same report twice = one audit entry
+        assert cli.main(["sftp-firewall", "report", "--state", "open", "--message", "TCP 2222 open"]) == 0
+    fw = c.get("/api/admin/sftp").json()["server"]["firewall"]
+    assert fw["state"] == "open" and fw["message"] == "TCP 2222 open" and fw["at"]
+    assert [a for a, *_ in _audit(env, "system.sftp_firewall")] == ["system.sftp_firewall.open"]
+    assert [a for a, *_ in _audit(env, "admin.sftp.server")] == ["admin.sftp.server"]
+
+
+def test_supervisor_follows_switch_and_kicks_disabled_accounts(env):
+    _setup(env)
+    port = _free_port()
+
+    def setting(on: bool):
+        with env["db"].conn() as c:
+            for k, v in (("sftp_enabled", "1" if on else "0"), ("sftp_port", str(port))):
+                c.execute("INSERT INTO settings(key, value) VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (k, v))
+
+    async def wait(cond, secs=5.0):
+        for _ in range(int(secs / 0.05)):
+            if cond():
+                return True
+            await asyncio.sleep(0.05)
+        return False
+
+    async def main():
+        setting(True)
+        task = asyncio.create_task(tvsftp.supervise(env["cfg"], env["db"], interval=0.1))
+        try:
+            assert await wait(lambda: tvsftp.STATUS["listening"])
+            conn = await _connect(port)
+            s = await conn.start_sftp_client()
+            assert "2026" in await s.listdir("/")
+            with env["db"].conn() as c:                      # disabling the feed drops the live session
+                c.execute("UPDATE sftp_accounts SET active = 0")
+            assert await wait(lambda: conn.is_closed())
+            with env["db"].conn() as c:
+                c.execute("UPDATE sftp_accounts SET active = 1")
+            setting(False)                                     # switching the server off stops listening
+            assert await wait(lambda: not tvsftp.STATUS["listening"])
+            with pytest.raises(OSError):
+                await _connect(port)
+        finally:
+            task.cancel()
+    asyncio.run(main())

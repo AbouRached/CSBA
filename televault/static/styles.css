@@ -149,3 +149,4 @@ td.wrap { white-space: normal; min-width: 180px; max-width: 360px; }
 .spaced { margin-top: 16px; }
 .row > label:has(> textarea) { flex: 1 1 320px; }
 .row > label > textarea { width: 100%; resize: vertical; }
+.status-list { list-style: none; padding: 0; margin: 0 0 14px; display: flex; flex-direction: column; gap: 6px; }

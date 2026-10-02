@@ -5,6 +5,7 @@ their own customer only. Nobody can create a superadmin from the web.
 """
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -733,11 +734,56 @@ def _sftp_password() -> tuple[str, str]:
 @router.get("/sftp")
 def list_sftp(p: Principal = Depends(require_superadmin), conn: sqlite3.Connection = Depends(get_conn),
               cfg: Config = Depends(get_cfg)):
-    from .sftp import host_fingerprint
+    from .sftp import STATUS, firewall_plan, host_fingerprint, server_settings
     rows = conn.execute("SELECT a.*, c.name AS customer_name FROM sftp_accounts a "
                         "JOIN customers c ON c.id = a.customer_id ORDER BY a.username").fetchall()
-    return {"enabled": cfg.sftp_port > 0, "port": cfg.sftp_port,
-            "host_fingerprint": host_fingerprint(cfg), "accounts": [_sftp_window(conn, r) for r in rows]}
+    server = server_settings(conn, cfg)
+    server.update(listening=STATUS["listening"] and STATUS["port"] == server["port"], listen_error=STATUS["error"],
+                  lan_ip=_lan_ip(), allowed_ips=firewall_plan(conn, cfg)["ips"])
+    return {"server": server, "host_fingerprint": host_fingerprint(cfg),
+            "accounts": [_sftp_window(conn, r) for r in rows]}
+
+
+def _lan_ip() -> str:
+    """This PC's LAN address (for the router port-forward instructions). Sends nothing."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))   # TEST-NET address: only picks the outgoing interface
+            return s.getsockname()[0]
+    except OSError:
+        return ""
+
+
+class SftpServerIn(BaseModel):
+    enabled: bool
+    port: int = Field(ge=1024, le=65535)
+    public_host: str = Field(default="", max_length=253)
+
+
+_HOST_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+
+
+@router.put("/sftp/server")
+def update_sftp_server(body: SftpServerIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                       conn: sqlite3.Connection = Depends(get_conn), cfg: Config = Depends(get_cfg)):
+    from .sftp import RESERVED_PORTS
+    if body.port in RESERVED_PORTS | {cfg.port, cfg.mcp_port}:
+        raise HTTPException(400, f"Port {body.port} is used by TeleVault itself - choose another (e.g. 2222).")
+    host = body.public_host.strip().lower()
+    if host:
+        try:
+            ipaddress.ip_address(host)
+        except ValueError:
+            if not _HOST_RE.match(host):
+                raise HTTPException(400, "Public address: a hostname (sftp.example.com) or an IP address.")
+    for k, v in (("sftp_enabled", "1" if body.enabled else "0"), ("sftp_port", str(body.port)), ("sftp_public_host", host)):
+        conn.execute("INSERT INTO settings(key, value, updated_by) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                     "value = excluded.value, updated_by = excluded.updated_by, "
+                     "updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')", (k, v, p.username))
+    audit.log(conn, "admin.sftp.server", user_id=p.user_id, username=p.username, ip=client_ip(request),
+              detail=f"enabled={int(body.enabled)} port={body.port} public_host={host or '-'}")
+    return {"ok": True}
 
 
 def _sftp_window(conn: sqlite3.Connection, r: sqlite3.Row) -> dict:

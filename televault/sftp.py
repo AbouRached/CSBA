@@ -2,8 +2,10 @@
 window of ONE customer's recordings.
 
 Gates (ADR-0001 item 18):
-- Off unless config `sftp_port` is set. Own port; the Windows firewall rule and the router
-  forward are limited to the vendor's addresses (scripts/install-sftp.ps1).
+- Switched on/off and given its port by superadmins on the SFTP feeds page (step-up); the
+  process starts/stops the listener itself (supervise()). The Windows firewall rule is kept
+  by the SYSTEM worker (scripts/grant-worker.ps1), which re-validates the wanted port and
+  addresses and only ever touches its own rule; no feed with addresses = no rule.
 - Accounts are managed by superadmins in the admin UI (step-up code). Each is pinned to one
   customer and a window in days of call time, counted back from that customer's LATEST
   recording (drives are often filled in batches, so "today" would leave the window empty);
@@ -195,6 +197,22 @@ class Feed:
         self.cfg, self.db = cfg, db
         self._trees: dict[tuple[int, int], Tree] = {}
         self._fails: dict[str, deque] = {}
+        self.conns: set = set()
+
+    def kick_stale(self) -> None:
+        """Drop live sessions whose account was disabled, deleted or moved to other addresses."""
+        for conn in list(self.conns):
+            a, ip = conn.get_extra_info("tv_account"), conn.get_extra_info("tv_ip") or ""
+            if not a:
+                continue
+            now = self.account(a["username"])
+            if not now or now["id"] != a["id"] or now["customer_id"] != a["customer_id"]                     or not _in(ip, json.loads(now["allowed_ips_json"] or "[]")):
+                log.info("sftp: closing session of %s (account changed)", a["username"])
+                conn.abort()
+
+    def close_all(self) -> None:
+        for conn in list(self.conns):
+            conn.abort()
 
     # failures per source address
     def blocked(self, ip: str) -> bool:
@@ -283,11 +301,15 @@ class _SSHServer(asyncssh.SSHServer):
 
     def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
         self.conn = conn
+        self.feed.conns.add(conn)
         peer = conn.get_extra_info("peername")
         self.ip = str(peer[0]) if peer else ""
         if self.feed.blocked(self.ip) or not self.feed.known_address(self.ip):
             log.info("sftp: dropped connection from %s", self.ip)
             conn.abort()
+
+    def connection_lost(self, exc) -> None:
+        self.feed.conns.discard(self.conn)
 
     def begin_auth(self, username: str) -> bool:
         acct = self.feed.account(username)
@@ -421,16 +443,75 @@ class _ReadOnlySFTP(asyncssh.SFTPServer):
     statvfs = fstatvfs = lock = unlock = fsync = _unsupported
 
 
-async def start(cfg: Config, db: Database):
-    """Start the SFTP listener (called from main.run when sftp_port is set)."""
-    feed = Feed(cfg, db)
+# ---------------------------------------------------------------- server settings (admin UI) and runtime
+
+RESERVED_PORTS = {8443, 8765}
+
+
+def server_settings(conn, cfg: Config) -> dict:
+    """What the SFTP feeds page saved; config.json only provides the first defaults."""
+    kv = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM settings WHERE key LIKE 'sftp_%'")}
+    return {
+        "enabled": kv.get("sftp_enabled", "1" if cfg.sftp_port else "0") == "1",
+        "port": int(kv.get("sftp_port", cfg.sftp_port or 2222)),
+        "public_host": kv.get("sftp_public_host", ""),
+        "firewall": {"state": kv.get("sftp_fw_state", "unknown"), "message": kv.get("sftp_fw_message", ""),
+                     "at": kv.get("sftp_fw_at")},
+    }
+
+
+def firewall_plan(conn, cfg: Config) -> dict:
+    """What the SYSTEM worker should open: the port, only from active feeds' addresses."""
+    s = server_settings(conn, cfg)
+    ips: set[str] = set()
+    for (j,) in conn.execute("SELECT allowed_ips_json FROM sftp_accounts WHERE active = 1"):
+        ips.update(json.loads(j or "[]"))
+    return {"enabled": s["enabled"], "port": s["port"], "ips": sorted(ips)}
+
+
+STATUS: dict = {"listening": False, "port": None, "error": ""}
+
+
+async def start(cfg: Config, db: Database, port: int | None = None, feed: Feed | None = None):
+    """Start the SFTP listener (supervise() does this from the saved settings; tests call it)."""
+    feed = feed or Feed(cfg, db)
+    port = cfg.sftp_port if port is None else port
     server = await asyncssh.listen(
-        cfg.sftp_host, cfg.sftp_port,
+        cfg.sftp_host, port,
         server_factory=lambda: _SSHServer(feed),
         server_host_keys=[host_key(cfg)],
         sftp_factory=lambda chan: _ReadOnlySFTP(chan, feed),
         allow_scp=False, agent_forwarding=False, x11_forwarding=False,
         login_timeout=30, keepalive_interval=60,
     )
-    log.info("SFTP feed on %s:%d (host key %s)", cfg.sftp_host, cfg.sftp_port, host_fingerprint(cfg))
+    log.info("SFTP feed on %s:%d (host key %s)", cfg.sftp_host, port, host_fingerprint(cfg))
     return server
+
+
+async def supervise(cfg: Config, db: Database, interval: float = 5.0) -> None:
+    """Runs for the life of the process: follows the on/off switch and port saved in the admin
+    UI, and drops sessions of accounts that were disabled or changed."""
+    feed = Feed(cfg, db)
+    server, port = None, None
+    while True:
+        try:
+            with db.conn() as c:
+                want = server_settings(c, cfg)
+            if server and (not want["enabled"] or want["port"] != port):
+                server.close()
+                feed.close_all()
+                server, port = None, None
+                STATUS.update(listening=False, port=None, error="")
+            if want["enabled"] and server is None:
+                try:
+                    server = await start(cfg, db, want["port"], feed)
+                    port = want["port"]
+                    STATUS.update(listening=True, port=port, error="")
+                except OSError as e:
+                    if STATUS["error"] != str(e):
+                        log.warning("SFTP feed could not listen on %s: %s", want["port"], e)
+                    STATUS.update(listening=False, port=None, error=f"port {want['port']}: {e.strerror or e}")
+            feed.kick_stale()
+        except Exception:  # noqa: BLE001 - never let the feed take the web app down
+            log.exception("sftp supervisor")
+        await asyncio.sleep(interval)

@@ -76,7 +76,7 @@ See [SECURITY.md](SECURITY.md) for the security model.
 | `access_team_domain` / `access_aud` | "" | Cloudflare Access application for staff verification (off when empty) |
 | `staff_emails` | [] | Seeds the in-app Staff access list on first run |
 | `mcp_port` | 8765 | Local MCP endpoint (127.0.0.1 only; 0 disables) |
-| `sftp_port` / `sftp_host` | 0 / 0.0.0.0 | Read-only SFTP feed for external systems (0 = off); feeds managed in the admin UI, firewall via `scripts/install-sftp.ps1` |
+| `sftp_port` / `sftp_host` | 0 / 0.0.0.0 | Read-only SFTP feed for external systems (0 = off); on/off, port and feeds managed in the admin UI; firewall rule kept by the SYSTEM grant worker |
 | `zip_max_files` / `zip_max_bytes` | 500 / 2 GB | Bulk download limits |
 | `login_max_failures` / `login_lock_minutes` | 5 / 15 | Account lockout |
 | `index_interval_minutes` | 15 | Rescan interval |

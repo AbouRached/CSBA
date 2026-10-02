@@ -174,6 +174,15 @@ CREATE TABLE IF NOT EXISTS sftp_accounts (
     last_ip           TEXT
 );
 
+-- Small settings changed from the admin UI (e.g. SFTP feed on/off, port, public host) and
+-- status written back by the SYSTEM worker (sftp_fw_*).
+CREATE TABLE IF NOT EXISTS settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_by  TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
 -- Extra staff networks (CIDR) managed in the admin UI, on top of config.json's staff_networks.
 CREATE TABLE IF NOT EXISTS staff_networks (
     id          INTEGER PRIMARY KEY,
