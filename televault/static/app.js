@@ -637,7 +637,7 @@ async function viewSftp(main, shown = null) {
       !sv.enabled ? "off" : sv.listening ? `listening on port ${sv.port}` : (sv.listen_error ? `not listening - ${sv.listen_error}` : "starting (refresh in a few seconds)")),
     statusLine("Windows firewall", fwAge > 3 ? false : fw.state === "open" ? true : fw.state === "error" ? false : null,
       fwAge > 3 ? "no report from the TeleVault Grant Worker task in the last minutes - is it installed and running?" : `${fw.message} (checked ${fmtTs(fw.at)})`),
-    statusLine("Router (network team)", null, sv.enabled && sv.allowed_ips.length
+    statusLine("Internet router (you set this once)", null, sv.enabled && sv.allowed_ips.length
       ? `forward public TCP ${sv.port}${sv.public_host ? ` on ${sv.public_host}` : ""} → ${sv.lan_ip || "this PC"}:${sv.port}, allowed only from ${sv.allowed_ips.join(", ")}`
       : "nothing to forward yet"),
     h("li", {}, h("b", {}, "Host key: "), h("code", {}, r.host_fingerprint), h("span", { class: "muted" }, " - vendors verify this on first connect")));
