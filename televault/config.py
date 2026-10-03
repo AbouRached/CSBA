@@ -61,6 +61,13 @@ DEFAULTS = {
     "sftp_host": "0.0.0.0",
     # Hostname the vendor connects to (tunnel mode: the Cloudflare hostname routed to ssh://localhost:<port>).
     "sftp_public_host": "",
+    # PBX pull (copy only). PBXs, schedule and thresholds are managed on the admin page "PBX pull";
+    # pbx_sources only seeds that list once (entries: name, customer slug, host, user, port, remote_dir)
+    # together with the host keys pinned in pbx_known_hosts. pbx_key is the job's SSH key
+    # (created on first run, readable by SYSTEM/Administrators only).
+    "pbx_sources": [],
+    "pbx_key": "data/pbxpull/id_ed25519",
+    "pbx_known_hosts": "data/pbxpull/known_hosts",
     # Operator name shown in the authenticator app, MCP server title and TLS certificate.
     "vendor_name": "",
 }
@@ -100,6 +107,9 @@ class Config:
     sftp_port: int = 0
     sftp_host: str = "0.0.0.0"
     sftp_public_host: str = ""
+    pbx_sources: list[dict] = field(default_factory=list)
+    pbx_key: Path = Path("data/pbxpull/id_ed25519")
+    pbx_known_hosts: Path = Path("data/pbxpull/known_hosts")
     vendor_name: str = ""
 
     @property
@@ -160,6 +170,9 @@ def load_config() -> Config:
         sftp_port=int(raw["sftp_port"]),
         sftp_host=str(raw["sftp_host"]).strip(),
         sftp_public_host=str(raw["sftp_public_host"]).strip().lower(),
+        pbx_sources=[dict(s) for s in raw["pbx_sources"]],
+        pbx_key=_p(raw["pbx_key"]),
+        pbx_known_hosts=_p(raw["pbx_known_hosts"]),
         vendor_name=str(raw["vendor_name"]).strip(),
     )
     cfg.data_dir.mkdir(parents=True, exist_ok=True)

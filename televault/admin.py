@@ -860,6 +860,210 @@ def delete_sftp(aid: int, request: Request, p: Principal = Depends(require_super
     return {"ok": True}
 
 
+# ---------------------------------------------------------------- PBX pull (copy-only job run by SYSTEM)
+# The web app only stores the PBX list, settings and requests; scripts/pbx-pull.ps1 -Tick (SYSTEM)
+# does the work and re-checks destinations itself (see pbxpull.py).
+
+class PbxSourceIn(BaseModel):
+    name: str = Field(min_length=2, max_length=40)
+    customer_id: int
+    host: str = Field(min_length=1, max_length=253)
+    port: int = Field(default=22, ge=1, le=65535)
+    username: str = Field(min_length=1, max_length=64)
+    remote_dir: str = Field(default="/var/spool/asterisk/monitor", min_length=1, max_length=300)
+    enabled: bool = True
+
+
+class PbxSettingsIn(BaseModel):
+    pbx_night_start: int
+    pbx_night_hours: int
+    pbx_day_enabled: int
+    pbx_day_from: int
+    pbx_day_to: int
+    pbx_recent_days: int
+    pbx_alert_pct: int
+    pbx_min_age_minutes: int
+    pbx_parallel: int
+    pbx_min_free_gb: int
+
+
+class PbxRunIn(BaseModel):
+    source_id: int | None = None
+
+
+_PBX_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{1,39}$")
+_PBX_USER = re.compile(r"^[a-z_][a-z0-9_.-]{0,63}$")
+_PBX_DIR = re.compile(r"^/[A-Za-z0-9._/-]*$")
+
+
+def _pbx_validate(conn: sqlite3.Connection, body: PbxSourceIn) -> tuple[str, str, str, str]:
+    name, host, user = body.name.strip().lower(), body.host.strip().lower(), body.username.strip()
+    rdir = body.remote_dir.strip().rstrip("/") or "/"
+    if not _PBX_NAME.match(name):
+        raise HTTPException(400, "Name: 2-40 characters, lowercase letters, digits, dot, dash, underscore.")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        if not _HOST_RE.match(host):
+            raise HTTPException(400, "Address: an IP address or a host name.")
+    if not _PBX_USER.match(user):
+        raise HTTPException(400, "SSH user: a Linux user name such as root.")
+    if not _PBX_DIR.match(rdir) or ".." in rdir.split("/"):
+        raise HTTPException(400, "Recordings folder: an absolute path such as /var/spool/asterisk/monitor.")
+    if conn.execute("SELECT 1 FROM customers WHERE id = ?", (body.customer_id,)).fetchone() is None:
+        raise HTTPException(400, "Unknown customer.")
+    return name, host, user, rdir
+
+
+def _pbx_json(r: sqlite3.Row) -> dict:
+    def fp(key_text: str) -> list[str]:
+        import asyncssh
+        out = []
+        for line in (key_text or "").splitlines():
+            try:
+                out.append(asyncssh.import_public_key(line.strip()).get_fingerprint())
+            except Exception:  # noqa: BLE001
+                pass
+        return out
+    trusted, seen = fp(r["host_key"]), fp(r["host_key_seen"])
+    return {"id": r["id"], "name": r["name"], "customer_id": r["customer_id"], "customer": r["customer_name"],
+            "root_path": r["root_path"], "host": r["host"], "port": r["port"], "username": r["username"],
+            "remote_dir": r["remote_dir"], "enabled": bool(r["enabled"]),
+            "trusted_fingerprints": trusted, "seen_fingerprints": seen,
+            "needs_trust": bool(seen) and not set(seen) <= set(trusted),
+            "test_pending": bool(r["test_requested"]),
+            "test": json.loads(r["test_json"]) if r["test_json"] else None,
+            "status": json.loads(r["status_json"]) if r["status_json"] else None}
+
+
+@router.get("/pbx")
+def pbx_overview(p: Principal = Depends(require_superadmin), conn: sqlite3.Connection = Depends(get_conn)):
+    from . import pbxpull
+    kv = {r[0]: r[1] for r in conn.execute("SELECT key, value FROM settings WHERE key IN "
+                                           "('pbx_public_key','pbx_tick_at','pbx_run_requested')")}
+    pub, lan = kv.get("pbx_public_key", ""), _lan_ip()
+    rows = conn.execute("SELECT s.*, c.name AS customer_name, c.root_path FROM pbx_sources s "
+                        "JOIN customers c ON c.id = s.customer_id ORDER BY s.name").fetchall()
+    return {"settings": pbxpull.get_settings(conn), "limits": {k: [lo, hi] for k, (_d, lo, hi) in pbxpull.SETTINGS.items()},
+            "sources": [_pbx_json(r) for r in rows], "tick_at": kv.get("pbx_tick_at"),
+            "run_requested": kv.get("pbx_run_requested", ""),
+            # one line for the PBX's ~/.ssh/authorized_keys: read-only SFTP, from this PC only
+            "key_line": f'restrict,from="{lan}",command="internal-sftp -R" {pub}' if pub and lan else ""}
+
+
+@router.post("/pbx")
+def pbx_create(body: PbxSourceIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+               conn: sqlite3.Connection = Depends(get_conn)):
+    name, host, user, rdir = _pbx_validate(conn, body)
+    try:
+        cur = conn.execute("INSERT INTO pbx_sources(name, customer_id, host, port, username, remote_dir, enabled, "
+                           "test_requested, created_by) VALUES (?,?,?,?,?,?,?,1,?)",
+                           (name, body.customer_id, host, body.port, user, rdir, int(body.enabled), p.username))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "A PBX with that name already exists.")
+    audit.log(conn, "admin.pbx.create", user_id=p.user_id, username=p.username, customer_id=body.customer_id,
+              ip=client_ip(request), detail=f"{name} {user}@{host}:{body.port} {rdir}")
+    return {"id": cur.lastrowid}
+
+
+@router.put("/pbx/settings")
+def pbx_settings(body: PbxSettingsIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+                 conn: sqlite3.Connection = Depends(get_conn)):
+    from . import pbxpull
+    vals = body.model_dump()
+    for k, (_d, lo, hi) in pbxpull.SETTINGS.items():
+        if not lo <= vals[k] <= hi:
+            raise HTTPException(400, f"{k.replace('pbx_', '').replace('_', ' ')}: between {lo} and {hi}.")
+    for k, v in vals.items():
+        pbxpull._set(conn, k, str(v), p.username)
+    audit.log(conn, "admin.pbx.settings", user_id=p.user_id, username=p.username, ip=client_ip(request),
+              detail=" ".join(f"{k[4:]}={v}" for k, v in vals.items()))
+    return {"ok": True}
+
+
+@router.post("/pbx/run")
+def pbx_run(body: PbxRunIn, request: Request, p: Principal = Depends(require_superadmin),
+            conn: sqlite3.Connection = Depends(get_conn)):
+    from . import pbxpull
+    target = "all"
+    if body.source_id is not None:
+        row = conn.execute("SELECT name FROM pbx_sources WHERE id = ?", (body.source_id,)).fetchone()
+        if row is None:
+            raise HTTPException(404, "No such PBX.")
+        target = row["name"]
+    pbxpull._set(conn, "pbx_run_requested", target, p.username)
+    audit.log(conn, "admin.pbx.run", user_id=p.user_id, username=p.username, ip=client_ip(request), detail=target)
+    return {"ok": True}
+
+
+def _pbx_row(conn: sqlite3.Connection, sid: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM pbx_sources WHERE id = ?", (sid,)).fetchone()
+    if row is None:
+        raise HTTPException(404, "No such PBX.")
+    return row
+
+
+@router.put("/pbx/{sid}")
+def pbx_update(sid: int, body: PbxSourceIn, request: Request, p: Principal = Depends(require_superadmin_stepup),
+               conn: sqlite3.Connection = Depends(get_conn)):
+    old = _pbx_row(conn, sid)
+    name, host, user, rdir = _pbx_validate(conn, body)
+    moved = (host, body.port) != (old["host"], old["port"])     # another machine: its key must be trusted again
+    try:
+        conn.execute("UPDATE pbx_sources SET name=?, customer_id=?, host=?, port=?, username=?, remote_dir=?, enabled=?, "
+                     "host_key = CASE WHEN ? THEN '' ELSE host_key END, "
+                     "host_key_seen = CASE WHEN ? THEN '' ELSE host_key_seen END, test_requested = 1 WHERE id = ?",
+                     (name, body.customer_id, host, body.port, user, rdir, int(body.enabled), moved, moved, sid))
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "A PBX with that name already exists.")
+    audit.log(conn, "admin.pbx.update", user_id=p.user_id, username=p.username, customer_id=body.customer_id,
+              ip=client_ip(request), detail=f"{name} {user}@{host}:{body.port} {rdir} enabled={int(body.enabled)}"
+                                            + (" (address changed: host key must be trusted again)" if moved else ""))
+    return {"ok": True}
+
+
+@router.delete("/pbx/{sid}")
+def pbx_delete(sid: int, request: Request, p: Principal = Depends(require_superadmin_stepup),
+               conn: sqlite3.Connection = Depends(get_conn)):
+    row = _pbx_row(conn, sid)
+    conn.execute("DELETE FROM pbx_sources WHERE id = ?", (sid,))
+    audit.log(conn, "admin.pbx.delete", user_id=p.user_id, username=p.username, customer_id=row["customer_id"],
+              ip=client_ip(request), detail=f"{row['name']} ({row['host']}) - recordings already copied are kept")
+    return {"ok": True}
+
+
+@router.post("/pbx/{sid}/test")
+def pbx_test(sid: int, request: Request, p: Principal = Depends(require_superadmin),
+             conn: sqlite3.Connection = Depends(get_conn)):
+    _pbx_row(conn, sid)
+    conn.execute("UPDATE pbx_sources SET test_requested = 1 WHERE id = ?", (sid,))
+    return {"ok": True}
+
+
+@router.post("/pbx/{sid}/trust")
+def pbx_trust(sid: int, request: Request, p: Principal = Depends(require_superadmin_stepup),
+              conn: sqlite3.Connection = Depends(get_conn)):
+    """Trust the host key the last connection test saw. Pulling starts only after this."""
+    row = _pbx_row(conn, sid)
+    if not row["host_key_seen"].strip():
+        raise HTTPException(409, "Run a connection test first.")
+    conn.execute("UPDATE pbx_sources SET host_key = host_key_seen WHERE id = ?", (sid,))
+    audit.log(conn, "admin.pbx.trust", user_id=p.user_id, username=p.username, customer_id=row["customer_id"],
+              ip=client_ip(request), detail=f"{row['name']} ({row['host']}) {' '.join(_pbx_json_fp(row['host_key_seen']))}")
+    return {"ok": True}
+
+
+def _pbx_json_fp(key_text: str) -> list[str]:
+    import asyncssh
+    out = []
+    for line in (key_text or "").splitlines():
+        try:
+            out.append(asyncssh.import_public_key(line.strip()).get_fingerprint())
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 # ---------------------------------------------------------------- staff networks (office / VPN)
 
 class StaffNetworkIn(BaseModel):

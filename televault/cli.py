@@ -223,6 +223,32 @@ def cmd_sftp_firewall(args) -> int:
     return 0
 
 
+def cmd_pbx_pull(args) -> int:
+    """Copy new recordings from the PBXs to the archive drives (never deletes anything).
+    'tick' is what the SYSTEM task runs every few minutes: it follows the PBX list, schedule,
+    tests and 'run now' set on the admin page. Without 'tick' it pulls once, e.g. --dry-run."""
+    import asyncio
+    from logging.handlers import RotatingFileHandler
+    from . import audit, pbxpull
+    cfg = load_config()
+    audit.configure(cfg.audit_to_eventlog)
+    fh = RotatingFileHandler(cfg.data_dir / "pbxpull.log", maxBytes=2_000_000, backupCount=5, encoding="utf-8")
+    fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    logging.getLogger("televault.pbxpull").addHandler(fh)
+    logging.getLogger("televault.pbxpull").setLevel(logging.INFO)
+    db = Database(cfg.db_path)
+    if args.action == "tick":
+        print(asyncio.run(pbxpull.tick(cfg, db)))
+        return 0
+    results = asyncio.run(pbxpull.run(cfg, db, only=args.source, dry_run=args.dry_run, max_hours=args.max_hours,
+                                      only_day=args.day, recent_days=args.recent_days))
+    for st in results:
+        print(("[dry run] " if args.dry_run else "") + st.line())
+        for e in st.errors[:5]:
+            print("   ", e)
+    return 1 if any(st.bad for st in results) else 0
+
+
 def cmd_mcp_token(args) -> int:
     """Console token management for the local MCP endpoint (the admin UI does the same)."""
     from .mcp_server import create_token
@@ -403,6 +429,15 @@ def main(argv: list[str] | None = None) -> int:
     sf.add_argument("--state", choices=["open", "closed", "error"])
     sf.add_argument("--message", default="")
     sf.set_defaults(fn=cmd_sftp_firewall)
+
+    pp = sub.add_parser("pbx-pull", help="copy new recordings from the PBXs to the archive drives (copy only)")
+    pp.add_argument("action", nargs="?", choices=["tick"], help="tick = follow the admin page (SYSTEM task)")
+    pp.add_argument("--source", help="only this PBX (its name on the PBX pull page)")
+    pp.add_argument("--dry-run", action="store_true", help="only report what would be copied")
+    pp.add_argument("--max-hours", type=float, help="stop after this long; the next run continues")
+    pp.add_argument("--day", help="only this day folder, e.g. 2026/10/02")
+    pp.add_argument("--recent-days", type=int, help="only the newest N day folders (today counts as 1)")
+    pp.set_defaults(fn=cmd_pbx_pull)
 
     bk = sub.add_parser("backup", help="back up database + mfa.key + TLS pair")
     bk.add_argument("dest", help="backup folder, e.g. C:\\TeleVaultBackups")

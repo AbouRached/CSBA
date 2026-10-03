@@ -94,7 +94,7 @@ function render() {
   if (!state.me.mfa_ok) { $("#nav").replaceChildren(); viewMfa(main); return; }
   if (state.me.must_change_password) { state.view = "password"; }
   renderNav();
-  const views = { recordings: viewRecordings, password: viewPassword, customers: viewCustomers, departments: viewDepartments, users: viewUsers, staff: viewStaffAccess, sftp: viewSftp, dev: viewDevAccess, audit: viewAudit };
+  const views = { recordings: viewRecordings, password: viewPassword, customers: viewCustomers, departments: viewDepartments, users: viewUsers, staff: viewStaffAccess, pbx: viewPbx, sftp: viewSftp, dev: viewDevAccess, audit: viewAudit };
   (views[state.view] || viewRecordings)(main);
 }
 
@@ -103,7 +103,7 @@ function renderNav() {
   if (isAdmin() && !state.me.must_change_password) {
     if (state.me.role === "superadmin") items.push(["customers", "Customers"]);
     items.push(["departments", "Departments"], ["users", "Users"]);
-    if (state.me.role === "superadmin") items.push(["staff", "Staff access"], ["sftp", "SFTP feeds"], ["dev", "Developer access"]);
+    if (state.me.role === "superadmin") items.push(["staff", "Staff access"], ["pbx", "PBX pull"], ["sftp", "SFTP feeds"], ["dev", "Developer access"]);
     items.push(["audit", "Audit log"]);
   }
   items.push(["password", "Password"]);
@@ -537,6 +537,112 @@ async function viewDevAccess(main) {
       h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["Name", "Scope", "Created", "Last used", "Status", ""].map(x => h("th", {}, x)))),
         h("tbody", {}, ...rows, r.tokens.length ? null : h("tr", {}, h("td", { colspan: "6", class: "muted" }, "No tokens yet.")))))),
     h("div", { class: "card" }, h("h2", {}, "Create a token"), secretBox, form));
+}
+
+/* ------------------------------------------------------------------ admin: PBX pull (copy only) */
+async function viewPbx(main) {
+  const [r, customers] = await Promise.all([api("/api/admin/pbx"), api("/api/admin/customers")]);
+  const act = async (fn, msg) => { try { await fn(); if (msg) toast(msg); render(); } catch (x) { toast(x.message, true); } };
+  const gb = (n) => n == null ? "" : `${Math.round(n)} GB`;
+  const tickAge = r.tick_at ? (Date.now() - Date.parse(r.tick_at)) / 60000 : Infinity;
+  const S = r.settings;
+
+  const form = h("form", { class: "row" });
+  const fill = (a = null) => {
+    setKids(form,
+      h("h2", { class: "full" }, a ? `Edit ${a.name}` : "Add a PBX"),
+      h("label", {}, "Name", h("input", { name: "name", required: "", value: a?.name || "", placeholder: "acme-pbx", class: "mono" })),
+      h("label", {}, "Recordings go to customer", h("select", { name: "customer_id" }, ...customers.map(c => h("option", { value: c.id, selected: a?.customer_id === c.id ? "" : null }, `${c.name} — ${c.root_path}`)))),
+      h("label", {}, "PBX address", h("input", { name: "host", required: "", value: a?.host || "", placeholder: "10.0.0.5", class: "mono" })),
+      h("label", {}, "SSH port", h("input", { name: "port", type: "number", min: "1", max: "65535", value: a?.port || 22 })),
+      h("label", {}, "SSH user", h("input", { name: "username", required: "", value: a?.username || "root", class: "mono" })),
+      h("label", { class: "grow" }, "Recordings folder on the PBX", h("input", { name: "remote_dir", required: "", value: a?.remote_dir || "/var/spool/asterisk/monitor", class: "mono" })),
+      h("label", {}, "Enabled", h("select", { name: "enabled" }, h("option", { value: "1" }, "yes"), h("option", { value: "0", selected: a && !a.enabled ? "" : null }, "no"))),
+      h("button", { class: "btn primary", type: "submit" }, a ? "Save" : "Add PBX"),
+      a ? h("button", { class: "btn", type: "button", onclick: () => fill() }, "Cancel") : null);
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      const body = { name: form.name.value.trim(), customer_id: Number(form.customer_id.value), host: form.host.value.trim(),
+        port: Number(form.port.value), username: form.username.value.trim(), remote_dir: form.remote_dir.value.trim(), enabled: form.enabled.value === "1" };
+      act(() => a ? api(`/api/admin/pbx/${a.id}`, { method: "PUT", body }) : api("/api/admin/pbx", { method: "POST", body }),
+        a ? "Saved - connection test queued." : "PBX added - connection test queued (about 5 minutes).");
+    };
+  };
+  fill();
+
+  const rows = r.sources.map(s => {
+    const st = s.status, t = s.test;
+    const pct = st && st.disk_used_pct != null ? Math.round(st.disk_used_pct) : null;
+    const conn = s.test_pending ? h("span", { class: "muted" }, "test queued…")
+      : !t ? h("span", { class: "muted" }, "not tested")
+      : h("span", { class: t.ok ? "ok" : "error" }, t.ok ? "connects" : "fails", h("br"), h("span", { class: "muted small" }, t.message));
+    const key = s.needs_trust ? [h("span", { class: "warn-inline" }, s.trusted_fingerprints.length ? "host key CHANGED" : "host key not trusted yet"), h("br"),
+        h("code", {}, s.seen_fingerprints.join(" ")), h("br"),
+        h("button", { class: "btn small primary", type: "button", onclick: () => {
+          if (!confirm(`Trust this host key for ${s.name} (${s.host})?\n\n${s.seen_fingerprints.join("\n")}\n\nOnly do this if the PBX is the machine you expect${s.trusted_fingerprints.length ? " and you know why its key changed (e.g. it was reinstalled)" : ""}.`)) return;
+          act(() => api(`/api/admin/pbx/${s.id}/trust`, { method: "POST" }), "Host key trusted."); } }, "Trust this key")]
+      : s.trusted_fingerprints.length ? h("span", { class: "ok small", title: s.trusted_fingerprints.join(" ") }, "host key trusted")
+      : h("span", { class: "muted small" }, "run a test first");
+    return h("tr", {},
+      h("td", {}, h("b", {}, s.name), s.enabled ? null : h("span", { class: "muted" }, " (off)"), h("br"), h("span", { class: "muted small mono" }, `${s.username}@${s.host}:${s.port}`)),
+      h("td", {}, s.customer, h("br"), h("span", { class: "muted small mono" }, s.root_path)),
+      h("td", { class: "wrap" }, conn, h("br"), key),
+      h("td", {}, pct == null ? h("span", { class: "muted" }, "—")
+        : h("span", { class: pct >= S.pbx_alert_pct ? "error" : "ok" }, h("b", {}, `${pct}% used`), h("br"), h("span", { class: "small" }, `${gb(st.disk_free_gb)} free of ${gb(st.disk_total_gb)}`))),
+      h("td", { class: "wrap" }, !st ? h("span", { class: "muted" }, "no pull yet")
+        : [h("span", { class: st.errors || (st.stopped && !st.stopped.includes("time limit")) ? "warn-inline" : "" },
+            `${st.copied} files (${(st.bytes / 1e9).toFixed(1)} GB) copied` + (st.errors ? `, ${st.errors} errors` : "") + (st.stopped ? ` — ${st.stopped}` : "")),
+           h("br"), h("span", { class: "muted small" }, fmtTs(st.at))]),
+      h("td", { class: "actions" },
+        h("button", { class: "btn small", type: "button", onclick: () => act(() => api(`/api/admin/pbx/${s.id}/test`, { method: "POST" }), "Test queued (up to 5 minutes).") }, "Test"),
+        h("button", { class: "btn small", type: "button", onclick: () => act(() => api("/api/admin/pbx/run", { method: "POST", body: { source_id: s.id } }), "Pull queued (starts within 5 minutes).") }, "Pull now"),
+        h("button", { class: "btn small", type: "button", onclick: () => { fill(s); form.scrollIntoView({ behavior: "smooth" }); } }, "Edit"),
+        h("button", { class: "btn small danger", type: "button", onclick: () => {
+          if (!confirm(`Remove ${s.name} from the list? Recordings already copied stay in the archive; nothing changes on the PBX.`)) return;
+          act(() => api(`/api/admin/pbx/${s.id}`, { method: "DELETE" }), "Removed."); } }, "Remove")));
+  });
+
+  const num = (name, label, w) => h("label", {}, label, h("input", { name, type: "number", min: r.limits[name][0], max: r.limits[name][1], value: S[name], class: w || "" }));
+  const setForm = h("form", { class: "row" },
+    num("pbx_night_start", "Nightly full pull starts at (hour)"), num("pbx_night_hours", "…and may run for (hours)"),
+    h("label", {}, "Hourly daytime pull", h("select", { name: "pbx_day_enabled" }, h("option", { value: "1" }, "on"), h("option", { value: "0", selected: S.pbx_day_enabled ? null : "" }, "off"))),
+    num("pbx_day_from", "Daytime from (hour)"), num("pbx_day_to", "Daytime until (hour)"),
+    num("pbx_recent_days", "Daytime pull: newest days"),
+    num("pbx_alert_pct", "Warn when a PBX disk is this full (%)"),
+    num("pbx_min_age_minutes", "Skip files changed in the last (minutes)"),
+    num("pbx_parallel", "Simultaneous downloads per PBX"), num("pbx_min_free_gb", "Keep free on archive drive (GB)"),
+    h("button", { class: "btn primary", type: "submit" }, "Save settings"));
+  setForm.onsubmit = (e) => {
+    e.preventDefault();
+    const body = {}; for (const k of Object.keys(S)) body[k] = Number(setForm[k].value);
+    act(() => api("/api/admin/pbx/settings", { method: "PUT", body }), "Settings saved.");
+  };
+
+  const keyBox = r.key_line
+    ? [h("p", {}, "To connect a new PBX: sign in to it as the SSH user above and add this one line to ", h("code", {}, "~/.ssh/authorized_keys"),
+        " (create the folder with ", h("code", {}, "mkdir -p ~/.ssh && chmod 700 ~/.ssh"), " if needed). It allows read-only SFTP from this PC only — no shell, no deleting, no changes:"),
+       h("div", { class: "secret" }, r.key_line),
+       h("div", { class: "row spaced" }, h("button", { class: "btn", type: "button", onclick: async () => { try { await navigator.clipboard.writeText(r.key_line); toast("Copied."); } catch { toast("Select the text and copy it.", true); } } }, "Copy")),
+       h("p", { class: "muted small" }, "Then add the PBX below, wait for the test, check the host key fingerprint against the PBX (", h("code", {}, "ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub"), ") and click Trust.")]
+    : h("p", { class: "warn-inline" }, "The key is created the first time the TeleVault PBX Pull task runs.");
+
+  main.replaceChildren(
+    h("div", { class: "card" }, h("h2", {}, "PBX pull · recordings copied from each PBX (copy only)"),
+      h("p", { class: "muted" }, `New recordings are copied from each PBX into its customer's folder as YYYY\\MM\\DD, where TeleVault indexes them. Nightly at ${String(S.pbx_night_start).padStart(2, "0")}:00 everything missing is copied (up to ${S.pbx_night_hours} h)` +
+        (S.pbx_day_enabled ? `; hourly between ${S.pbx_day_from}:00 and ${S.pbx_day_to}:59 the newest ${S.pbx_recent_days} days.` : ".") +
+        " Nothing is ever deleted or changed on a PBX, and nothing in the archive is overwritten."),
+      h("p", {}, h("b", {}, "Worker: "), tickAge < 30 ? h("span", { class: "ok" }, `running (last check ${fmtTs(r.tick_at)})`)
+        : h("span", { class: "warn-inline" }, r.tick_at ? `no sign of life since ${fmtTs(r.tick_at)} — a long pull may be running, or the "TeleVault PBX Pull" task is stopped` : "the \"TeleVault PBX Pull\" task has not run yet"),
+        r.run_requested ? h("span", { class: "muted" }, ` · pull queued: ${r.run_requested}`) : null, " ",
+        h("button", { class: "btn small", type: "button", onclick: () => act(() => api("/api/admin/pbx/run", { method: "POST", body: {} }), "Pull of all PBXs queued (starts within 5 minutes).") }, "Pull all now")),
+      h("div", { class: "table-wrap" }, h("table", {}, h("thead", {}, h("tr", {}, ...["PBX", "Customer / folder", "Connection", "PBX recording disk", "Last pull", ""].map(t => h("th", {}, t)))),
+        h("tbody", {}, ...rows, r.sources.length ? null : h("tr", {}, h("td", { colspan: "6", class: "muted" }, "No PBX yet.")))))),
+    h("div", { class: "card" }, form),
+    h("div", { class: "card" }, h("h2", {}, "Key for new PBXs"), ...[].concat(keyBox)),
+    h("div", { class: "card" }, h("h2", {}, "Schedule and limits"), setForm));
+  clearTimeout(viewPbx._t);
+  if (r.sources.some(s => s.test_pending) || r.run_requested)
+    viewPbx._t = setTimeout(() => { if (state.view === "pbx" && !document.activeElement?.closest("form")) render(); }, 20000);
 }
 
 /* ------------------------------------------------------------------ admin: SFTP feeds */

@@ -174,6 +174,26 @@ CREATE TABLE IF NOT EXISTS sftp_accounts (
     last_ip           TEXT
 );
 
+-- PBXs whose recordings are pulled (copy only) into a customer's folder. Managed on the admin
+-- page; the SYSTEM job reads this list, runs the requested tests and writes status back.
+CREATE TABLE IF NOT EXISTS pbx_sources (
+    id              INTEGER PRIMARY KEY,
+    name            TEXT NOT NULL UNIQUE,
+    customer_id     INTEGER NOT NULL REFERENCES customers(id) ON DELETE CASCADE,
+    host            TEXT NOT NULL,
+    port            INTEGER NOT NULL DEFAULT 22,
+    username        TEXT NOT NULL,
+    remote_dir      TEXT NOT NULL DEFAULT '/var/spool/asterisk/monitor',
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    host_key        TEXT NOT NULL DEFAULT '',   -- trusted by a superadmin; empty = never pulled
+    host_key_seen   TEXT NOT NULL DEFAULT '',   -- what the last connection test saw
+    test_requested  INTEGER NOT NULL DEFAULT 0,
+    test_json       TEXT,
+    status_json     TEXT,
+    created_by      TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
 -- Small settings changed from the admin UI (e.g. SFTP feed on/off, port, public host) and
 -- status written back by the SYSTEM worker (sftp_fw_*).
 CREATE TABLE IF NOT EXISTS settings (

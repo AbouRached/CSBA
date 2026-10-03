@@ -112,6 +112,34 @@ Register-ScheduledTask -TaskName "TeleVault Grant Worker" -Action $gAction -Trig
     -Description "Applies read-only folder access requested in TeleVault's admin UI" -ErrorAction Stop | Out-Null
 Write-Host "Grant worker task registered (every minute, SYSTEM)"
 
+# 5c. PBX pull (copy only): new recordings from each PBX to its customer's archive folder.
+#     The SSH key is read-only SFTP on the PBXs; here it is readable by SYSTEM/Administrators only
+#     (NOT by the web app's service account). First run moves it out of the user's profile.
+$pbxDir = "$root\data\pbxpull"
+New-Item -ItemType Directory -Force $pbxDir | Out-Null
+foreach ($pair in @(@("pbx_pull_ed25519", "id_ed25519"), @("pbx_pull_known_hosts", "known_hosts"))) {
+    $from = "C:\Users\$SourceUser\.ssh\$($pair[0])"
+    if (Test-Path $from) {
+        Copy-Item $from "$pbxDir\$($pair[1])" -Force
+        if ($pair[0] -eq "pbx_pull_ed25519") { Remove-Item $from -Force; Remove-Item "$from.pub" -Force -ErrorAction SilentlyContinue }
+    }
+}
+icacls $pbxDir /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" /T /Q | Out-Null
+Unregister-ScheduledTask -TaskName "TeleVault PBX Pull" -Confirm:$false -ErrorAction SilentlyContinue
+Unregister-ScheduledTask -TaskName "TeleVault PBX Pull (daytime)" -Confirm:$false -ErrorAction SilentlyContinue
+# One SYSTEM task, every 5 minutes: it follows the "PBX pull" admin page (PBX list, connection
+# tests, schedule, run now). A long pull simply makes the next ticks wait (IgnoreNew).
+$pAction = New-ScheduledTaskAction -Execute "powershell.exe" -WorkingDirectory $root `
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$root\scripts\pbx-pull.ps1`" -Tick"
+$pTriggers = @(
+    (New-ScheduledTaskTrigger -AtStartup),
+    (New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(2) -RepetitionInterval (New-TimeSpan -Minutes 5))
+)
+$pSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 23)
+Register-ScheduledTask -TaskName "TeleVault PBX Pull" -Action $pAction -Trigger $pTriggers -Principal $bPrincipal -Settings $pSettings `
+    -Description "Copies new call recordings from the PBXs to the archive drives (copy only); configured in TeleVault's admin page" -ErrorAction Stop | Out-Null
+Write-Host "PBX pull task registered (every 5 minutes, SYSTEM, copy only) - configure it on the PBX pull page"
+
 # 6. No inbound port: the tunnel is the only way in
 Get-NetFirewallRule -DisplayName "TeleVault HTTPS" -ErrorAction SilentlyContinue | Remove-NetFirewallRule
 # One pass over the application filters (fast), then only the matching rules.
